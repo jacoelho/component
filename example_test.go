@@ -62,13 +62,13 @@ func Example() {
 	)
 
 	// Provide components and wire walkDependencies
-	component.MustProvide(sys, DBKey, func(sys *component.System) (*Database, error) {
+	component.Provide(sys, DBKey, func(sys *component.System) (*Database, error) {
 		return &Database{DSN: "postgres://..."}, nil
 	})
-	component.MustProvide(sys, MQKey, func(_ *component.System) (*MessageQueue, error) {
+	component.Provide(sys, MQKey, func(_ *component.System) (*MessageQueue, error) {
 		return &MessageQueue{URL: "amqp://..."}, nil
 	})
-	component.MustProvide(sys, AppKey, func(s *component.System) (*AppService, error) {
+	component.Provide(sys, AppKey, func(s *component.System) (*AppService, error) {
 		db, err := component.Get(s, DBKey)
 		if err != nil {
 			return nil, err

@@ -17,14 +17,14 @@ type stubComponent struct {
 	mu     *sync.Mutex
 }
 
-func (s *stubComponent) Start(ctx context.Context) error {
+func (s *stubComponent) Start(_ context.Context) error {
 	s.mu.Lock()
 	*s.events = append(*s.events, s.name+":start")
 	s.mu.Unlock()
 	return nil
 }
 
-func (s *stubComponent) Stop(ctx context.Context) error {
+func (s *stubComponent) Stop(_ context.Context) error {
 	s.mu.Lock()
 	*s.events = append(*s.events, s.name+":stop")
 	s.mu.Unlock()

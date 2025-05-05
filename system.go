@@ -94,18 +94,6 @@ func ProvideWithoutKey[T Lifecycle](
 	return Provide(sys, Key[T]{}, fn, deps...)
 }
 
-// MustProvide registers a component of type T, panics if it errors.
-func MustProvide[T Lifecycle](
-	sys *System,
-	key Key[T],
-	fn func(*System) (T, error),
-	deps ...keyer,
-) {
-	if err := Provide(sys, key, fn, deps...); err != nil {
-		panic(err)
-	}
-}
-
 // Get returns the already-started T.
 func Get[T Lifecycle](sys *System, key Key[T]) (T, error) {
 	var zero T
