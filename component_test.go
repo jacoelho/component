@@ -37,12 +37,10 @@ func TestStartupAndShutdownOrder(t *testing.T) {
 	ctx := context.Background()
 	sys := new(component.System)
 
-	// Declare keys
 	aKey := component.NewKey[*stubComponent]("A")
 	bKey := component.NewKey[*stubComponent]("B")
 	cKey := component.NewKey[*stubComponent]("C")
 
-	// Provide components: A and B are level 0, C depends on A and B
 	if err := component.Provide(sys, aKey, func(_ *component.System) (*stubComponent, error) {
 		return &stubComponent{"A", &events, mu}, nil
 	}); err != nil {
@@ -69,7 +67,6 @@ func TestStartupAndShutdownOrder(t *testing.T) {
 		t.Fatal("Provide C:", err)
 	}
 
-	// Start system
 	if err := sys.Start(ctx); err != nil {
 		t.Fatal("Start:", err)
 	}
@@ -85,7 +82,6 @@ func TestStartupAndShutdownOrder(t *testing.T) {
 		t.Errorf("level-0 must start before C; got order: %v", events)
 	}
 
-	// Stop system
 	if err := sys.Stop(ctx); err != nil {
 		t.Fatal("Stop:", err)
 	}
@@ -115,10 +111,14 @@ func TestCycleDetectionDirect(t *testing.T) {
 	}
 
 	// B depends on A -> cycle
-	if err := component.Provide(sys, bKey, func(_ *component.System) (*stubComponent, error) {
+	err := component.Provide(sys, bKey, func(_ *component.System) (*stubComponent, error) {
 		return &stubComponent{"B", nil, nil}, nil
-	}, aKey); err == nil {
+	}, aKey)
+	if err == nil {
 		t.Fatal("expected cycle detection when providing B")
+	}
+	if want := component.ErrCyclicDependency; !errors.Is(err, want) {
+		t.Fatalf("got error %v, want %v", err, want)
 	}
 }
 
@@ -143,10 +143,14 @@ func TestCycleDetectionIndirect(t *testing.T) {
 	}
 
 	// C depends on A --> cycle
-	if err := component.Provide(sys, cKey, func(_ *component.System) (*stubComponent, error) {
+	err := component.Provide(sys, cKey, func(_ *component.System) (*stubComponent, error) {
 		return &stubComponent{"C", nil, nil}, nil
-	}, aKey); err == nil {
+	}, aKey)
+	if err == nil {
 		t.Fatal("expected cycle detection when providing C")
+	}
+	if want := component.ErrCyclicDependency; !errors.Is(err, want) {
+		t.Fatalf("got error %v, want %v", err, want)
 	}
 }
 

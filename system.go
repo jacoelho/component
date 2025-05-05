@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -221,7 +221,6 @@ func (sys *System) stopLevel(ctx context.Context, ids []string) error {
 		}
 		sys.mu.Unlock()
 
-		// Record errors for missing entries
 		if !exists {
 			ec.appendf("missing entry for type %q: %w", id, ErrNotRegistered)
 			continue
@@ -231,7 +230,6 @@ func (sys *System) stopLevel(ctx context.Context, ids []string) error {
 			continue
 		}
 
-		// Check Lifecycle implementation
 		lc, ok := inst.(Lifecycle)
 		if !ok {
 			ec.appendf("%T does not implement Lifecycle", inst)
@@ -253,6 +251,9 @@ func (sys *System) stopLevel(ctx context.Context, ids []string) error {
 }
 
 func (sys *System) DotGraph() (string, error) {
+	sys.mu.Lock()
+	defer sys.mu.Unlock()
+
 	levels, err := computeLevels(sys.entries, false)
 	if err != nil {
 		return "", err
@@ -388,18 +389,15 @@ func formatCycle(path []string, cycleEnd string) string {
 func groupByLevel(levels map[string]int) (map[int][]string, int) {
 	groups := make(map[int][]string, len(levels))
 	maxLevel := 0
-	for id, lvl := range levels {
-		groups[lvl] = append(groups[lvl], id)
-		if lvl > maxLevel {
-			maxLevel = lvl
+	for id, level := range levels {
+		groups[level] = append(groups[level], id)
+		if level > maxLevel {
+			maxLevel = level
 		}
 	}
-	// sort each group
 	for level := range groups {
 		slice := groups[level]
-		sort.Slice(slice, func(i, j int) bool {
-			return slice[i] < slice[j]
-		})
+		slices.Sort(slice)
 		groups[level] = slice
 	}
 	return groups, maxLevel

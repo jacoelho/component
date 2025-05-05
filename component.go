@@ -11,18 +11,19 @@ import (
 type Lifecycle interface {
 	// Start initializes long-lived resources. Called in dependency order.
 	Start(context.Context) error
+
 	// Stop releases resources and terminates operations.
 	// Called in reverse dependency order during shutdown.
 	Stop(context.Context) error
 }
 
-// Key uniquely identifies a component producing type T in the system.
+// Key identifies a component producing type T in the system.
 type Key[T Lifecycle] struct {
 	name string
 }
 
 // NewKey returns a Key[T] with the given name.
-// name must be non‐empty if you plan to have >1 Key[T] in your System.
+// name must be non-empty if you plan to have >1 Key[T] in your System.
 // Repeated names with different underlying T is allowed.
 func NewKey[T Lifecycle](name string) Key[T] {
 	return Key[T]{name: name}
@@ -46,9 +47,8 @@ func (Key[T]) typ() reflect.Type {
 	return reflect.TypeOf(zero)
 }
 
-// String reports the type.
 func (k Key[T]) String() string {
-	return fmt.Sprintf("%v", k.typ())
+	return k.id()
 }
 
 // keyer provides type erasure for heterogeneous component keys.

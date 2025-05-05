@@ -3,6 +3,7 @@ package component_test
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jacoelho/component"
 )
@@ -10,11 +11,13 @@ import (
 type Database struct{ DSN string }
 
 func (db *Database) Start(ctx context.Context) error {
+	time.Sleep(time.Millisecond * 100)
 	fmt.Println("↳ DB connect:", db.DSN)
 	return nil
 }
 
 func (db *Database) Stop(ctx context.Context) error {
+	time.Sleep(time.Millisecond * 100)
 	fmt.Println("↳ DB close")
 	return nil
 }
@@ -22,11 +25,13 @@ func (db *Database) Stop(ctx context.Context) error {
 type MessageQueue struct{ URL string }
 
 func (mq *MessageQueue) Start(ctx context.Context) error {
+	time.Sleep(time.Millisecond * 200)
 	fmt.Println("↳ MQ connect:", mq.URL)
 	return nil
 }
 
 func (mq *MessageQueue) Stop(ctx context.Context) error {
+	time.Sleep(time.Millisecond * 200)
 	fmt.Println("↳ MQ close")
 	return nil
 }
@@ -88,11 +93,11 @@ func Example() {
 	}
 
 	// Output:
-	//↳ MQ connect: amqp://...
 	//↳ DB connect: postgres://...
+	//↳ MQ connect: amqp://...
 	//↳ AppService ready with DB & MQ
 	//▶ system is UP
 	//↳ AppService stopping
-	//↳ MQ close
 	//↳ DB close
+	//↳ MQ close
 }
