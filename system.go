@@ -84,6 +84,16 @@ func Provide[T Lifecycle](
 	return nil
 }
 
+// ProvideWithoutKey registers a component of type T, it's key is generated
+// Useful for components without dependents.
+func ProvideWithoutKey[T Lifecycle](
+	sys *System,
+	fn func(*System) (T, error),
+	deps ...keyer,
+) error {
+	return Provide(sys, Key[T]{}, fn, deps...)
+}
+
 // MustProvide registers a component of type T, panics if it errors.
 func MustProvide[T Lifecycle](
 	sys *System,
