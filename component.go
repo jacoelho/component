@@ -10,6 +10,7 @@ import (
 // Implementations should ensure Stop is idempotent and cleans up after Start.
 type Lifecycle interface {
 	// Start initializes long-lived resources. Called in dependency order.
+	// Should not block.
 	Start(context.Context) error
 
 	// Stop releases resources and terminates operations.
