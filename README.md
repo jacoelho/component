@@ -13,13 +13,13 @@ When you call `Start`, the system brings up your application **level by level**:
 2. Only once every level 0 component is running does it kick off **Level 1**, again in parallel.
 3. And so on, ensuring that at each component’s prerequisites are available.
 
-Shutdown (`Stop`) reverses this order automatically:
+`Stop` reverses this order automatically:
 
 1. **Highest level** components stop first.
 2. Once they’ve all shut down, the next lower level is torn down in parallel.
 3. …down to Level 0.
 
-If any component fails to start, **Component** will automatically roll back, stopping all already-started components.
+If any component fails to start, will automatically roll back, stopping all already-started components.
 
 ---
 
@@ -70,10 +70,11 @@ The `DotGraph` method emits your system’s dependency graph in [Graphviz](https
 
 ```bash
 dot := sys.DotGraph()
-fmt.Println(dot)
 
 // Save to file and render: dot -Tpng graph.dot > graph.png
 ```
+
+Example file:
 
 ```dot
 digraph G {
