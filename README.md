@@ -66,7 +66,7 @@ Shutdown:
 
 ## Generating a Dependency Graph
 
-The `DotGraph` method emits your system’s dependency graph in [Graphviz](https://graphviz.org/) DOT format, clustering components by their startup level and drawing directed edges from each dependency to its dependent.
+The `DotGraph` method emits your system's dependency graph in [Graphviz](https://graphviz.org/) DOT format, clustering components by their startup level and drawing directed edges from each dependency to its dependent.
 
 ```bash
 dot := sys.DotGraph()

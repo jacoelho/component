@@ -162,6 +162,7 @@ func (sys *System) Stop(ctx context.Context) error {
 	return nil
 }
 
+// startLevel starts all entries in parallel and returns combined errors.
 func (sys *System) startLevel(ctx context.Context, ids []string) error {
 	ec := newErrCollector()
 
@@ -250,6 +251,7 @@ func (sys *System) stopLevel(ctx context.Context, ids []string) error {
 	return ec.errors()
 }
 
+// DotGraph outputs the system's dependency graph in dot format.
 func (sys *System) DotGraph() (string, error) {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
