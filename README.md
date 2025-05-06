@@ -2,7 +2,9 @@
 
 **Component** provides a lightweight, type-safe framework for declaring, wiring, and orchestrating stateful services (e.g. database connections, message queues, HTTP servers) in Go.
 
-Under the hood, components form a directed acyclic dependency graph. Each component is assigned a **level** based on the longest chain of dependencies beneath it:
+All dependency relationships are **validated at runtime**, before any component is started to catch missing or cyclic declarations early. 
+
+Internally, components form a **directed acyclic graph** (DAG) and are assigned a **level** equal to the length of the longest chain of dependencies beneath them:
 
 - **Level 0**: no declared dependencies
 - **Level N**: depends only on components at levels < N
@@ -94,3 +96,28 @@ digraph G {
   "*component_test.Database" -> "*component_test.AppService";
   "*component_test.MessageQueue" -> "*component_test.AppService";
 ```
+
+## Comparison with Other Solutions
+
+Go offers several popular libraries for dependency injection and application lifecycle management. Here’s how **Component** compares:
+
+| Library         | Approach                             | Compile-time Safety | Runtime Overhead | Lifecycle Orchestration     | Complexity |
+|-----------------|--------------------------------------|---------------------|------------------|-----------------------------|------------|
+| **google/wire** | Static code generation               | ✅ High              | ⚪ Zero           | None (just DI wiring)       | Minimal    |
+| **uber/dig**    | Reflection-based container           | ⚪ Medium            | ⚫ Moderate       | None                        | Moderate   |
+| **uber/fx**     | `dig` + opinionated framework        | ⚪ Medium            | ⚫ Moderate       | ✅ Built-in start/stop hooks | High       |
+| **Component**   | Level-based, type-safe orchestration | ✅ High              | ⚪ Low            | ✅ Parallel start/stop       | Minimal    |
+
+- **google/wire**
+    - Uses compile-time code generation to wire dependencies.
+    - Zero runtime cost, but requires maintaining `wire.ProviderSet` definitions and rerunning `wire`.
+- **uber/dig**
+    - Relies on reflection to resolve constructor functions at runtime.
+    - Flexible and "plug-and-play", but introduces some reflection overhead and less explicit wiring.
+- **uber/fx**
+    - Builds on `dig` and adds an application framework with modules, hooks, and lifecycle hooks.
+    - Great for large, opinionated services, but comes with a larger API surface and more abstractions.
+- **Component**
+    - Emphasizes minimalism and idiomatic Go: uses zero-value `Key[T]`, generics, and simple maps.
+    - Validates dependencies at runtime, assigns each component a **level** (longest dependency chain), and starts/stops by level in parallel.
+    - Automatic rollback on startup failure ensures you never end up partially initialized.  
