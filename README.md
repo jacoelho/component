@@ -101,12 +101,12 @@ digraph G {
 
 Go offers several popular libraries for dependency injection and application lifecycle management. Here’s how **Component** compares:
 
-| Library         | Approach                             | Compile-time Safety | Runtime Overhead | Lifecycle Orchestration     | Complexity |
-|-----------------|--------------------------------------|---------------------|------------------|-----------------------------|------------|
-| **google/wire** | Static code generation               | ✅ High              | ⚪ Zero           | None (just DI wiring)       | Minimal    |
-| **uber/dig**    | Reflection-based container           | ⚪ Medium            | ⚫ Moderate       | None                        | Moderate   |
-| **uber/fx**     | `dig` + opinionated framework        | ⚪ Medium            | ⚫ Moderate       | ✅ Built-in start/stop hooks | High       |
-| **Component**   | Level-based, type-safe orchestration | ✅ High              | ⚪ Low            | ✅ Parallel start/stop       | Minimal    |
+| Library                                            | Approach                             | Compile-time Safety | Runtime Overhead | Lifecycle Orchestration     | Complexity |
+|----------------------------------------------------|--------------------------------------|---------------------|------------------|-----------------------------|------------|
+| [google/wire](https://github.com/google/wire)      | Static code generation               | ✅ High              | ⚪ Zero           | None (just DI wiring)       | Minimal    |
+| [uber/dig](https://github.com/uber-go/dig)         | Reflection-based container           | ⚪ Medium            | ⚫ Moderate       | None                        | Moderate   |
+| [uber/fx](https://github.com/uber-go/fx)           | `dig` + opinionated framework        | ⚪ Medium            | ⚫ Moderate       | ✅ Built-in start/stop hooks | High       |
+| [component](https://github.com/jacoelho/component) | Level-based, type-safe orchestration | ✅ High              | ⚪ Low            | ✅ Parallel start/stop       | Minimal    |
 
 - **google/wire**
     - Uses compile-time code generation to wire dependencies.
