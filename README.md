@@ -1,27 +1,17 @@
 # Component: A Type-Safe Dependency Orchestration Library
 
-**Component** provides a lightweight, type-safe framework for declaring, wiring, and orchestrating stateful services (e.g. database connections, message queues, HTTP servers) in Go.
+Component provides a lightweight, type-safe framework for declaring, wiring, and orchestrating stateful services (e.g., database connections, message queues, HTTP servers) in Go.
 
-All dependency relationships are **validated at runtime**, before any component is started to catch missing or cyclic declarations early. 
+It ensures that your application components start and stop in the correct order, with dependencies managed explicitly.
 
-Internally, components form a **directed acyclic graph** (DAG) and are assigned a **level** equal to the length of the longest chain of dependencies beneath them:
-
-- **Level 0**: no declared dependencies
-- **Level N**: depends only on components at levels < N
-
-When you call `Start`, the system brings up your application **level by level**:
-
-1. **Level 0** all start in parallel.
-2. Only once every level 0 component is running does it kick off **Level 1**, again in parallel.
-3. And so on, ensuring that at each component’s prerequisites are available.
-
-`Stop` reverses this order automatically:
-
-1. **Highest level** components stop first.
-2. Once they’ve all shut down, the next lower level is torn down in parallel.
-3. …down to Level 0.
-
-If any component fails to start, will automatically roll back, stopping all already-started components.
+- Type-Safe: Leverages Go generics for defining and retrieving components.
+- Runtime Validation: Dependency relationships, including cycles, are validated during component registration (Provide). Further validation for missing dependencies occurs before any component's Start method is invoked.
+- Level-Based Orchestration: Components form a directed acyclic graph (DAG) and are assigned a level based on their dependencies:
+  - Level 0: No declared dependencies.
+  - Level N: Depends only on components at levels < N.
+- Parallel Execution: Components at the same dependency level are started and stopped in parallel, maximizing efficiency while respecting order.
+- Automatic Rollback: If any component fails to start, the system automatically rolls back by stopping all already-started components.
+- Robust Shutdown: During shutdown, the system attempts to stop all components, even if some encounter errors, and aggregates any issues.
 
 ---
 
@@ -33,38 +23,124 @@ go get github.com/jacoelho/component
 
 ## Usage
 
-Check the [example](./example_test.go)
+```go
+package main
+
+import (
+  "context"
+  "fmt"
+  "log"
+  "time"
+
+  "github.com/jacoelho/component"
+)
+
+// 1. Define components
+type Logger struct{}
+
+func (l *Logger) Start(ctx context.Context) error { l.Log("Logger Started"); return nil }
+func (l *Logger) Stop(ctx context.Context) error  { l.Log("Logger Stopped"); return nil }
+func (l *Logger) Log(message string)              { fmt.Println(message) }
+
+type MainService struct{ logger *Logger }
+
+func (s *MainService) Start(ctx context.Context) error {
+  s.logger.Log("MainService Started")
+  return nil
+}
+func (s *MainService) Stop(ctx context.Context) error {
+  s.logger.Log("MainService Stopped")
+  return nil
+}
+
+func main() {
+  sys := new(component.System)
+  ctx := context.Background()
+
+  // Create Keys
+  var (
+    loggerKey  component.Key[*Logger]
+    serviceKey component.Key[*MainService]
+  )
+
+  // Provide components
+  if err := component.Provide(sys, loggerKey, func(_ *component.System) (*Logger, error) {
+    return &Logger{}, nil
+  }); err != nil {
+    log.Fatalf("Failed to provide logger: %v", err)
+  }
+
+  if err := component.Provide(sys, serviceKey, func(s *component.System) (*MainService, error) {
+    logger, err := component.Get(s, loggerKey) // Get dependency
+    if err != nil {
+      return nil, err
+    }
+    return &MainService{logger: logger}, nil
+  }, loggerKey); err != nil { // Declare dependency on loggerKey
+    log.Fatalf("Failed to provide main service: %v", err)
+  }
+
+  // Start system
+  fmt.Println("Starting system...")
+  startCtx, cancel := context.WithTimeout(ctx, time.Second*5)
+  defer cancel()
+  if err := sys.Start(startCtx); err != nil {
+    log.Fatalf("System start failed: %v", err)
+  }
+
+  fmt.Println("System is UP.")
+
+  // Stop system
+  fmt.Println("Stopping system...")
+  stopCtx, cancel := context.WithTimeout(ctx, time.Second*5)
+  defer cancel()
+  if err := sys.Stop(stopCtx); err != nil {
+    log.Printf("System stop encountered errors: %v", err)
+  }
+  fmt.Println("System shut down.")
+}
+```
+
+For a more detailed, runnable example demonstrating multiple components and dependencies, see [example_test.go](./example_test.go).
 
 ## Startup & Shutdown Order
 
-Below is a diagram illustrating the startup and shutdown sequence:
+Components are managed in levels based on their dependencies.
+
+### Startup
+
+The system brings up your application level by level:
+
+1. Level 0 components (no dependencies) all start in parallel.
+2. Once all Level 0 components are running, Level 1 components start in parallel.
+3. This continues until all levels are started, ensuring prerequisites are always available.
 
 ```mermaid
 flowchart TB
-  subgraph Startup
+  subgraph "Startup Sequence (Example)"
     direction LR
-    DB[Database] & MQ[MessageQueue] --> App[AppService]
+    L0["Level 0 (Parallel Start)"] -- "All Started" --> L1["Level 1 (Parallel Start)"]
+    subgraph L0
+      DB[Database]
+      MQ[MessageQueue]
+    end
+    subgraph L1
+      App[AppService]
+    end
+    DB -- "Dependency" --> App
+    MQ -- "Dependency" --> App
   end
 ``` 
 
-Startup:
-- Level 0: Database and MessageQueue start in parallel. 
-- Level 1: AppService starts once both Level 0 components are ready.
+### Shutdown:
 
+Stop reverses the startup order automatically:
 
+1. Components at the highest level stop first, in parallel.
+2. Once they've all shut down, the next lower level is torn down in parallel.
+3. This continues down to Level 0. The system attempts to stop all components even if errors occur, aggregating any issues.
 
-```mermaid
-flowchart TB
-  subgraph Shutdown
-    direction LR
-    App[AppService] --> DB[Database]
-    App[AppService] --> MQ[MessageQueue]
-  end
-```
-
-Shutdown:
-- Level 1: AppService stops first.
-- Level 0: Database and MessageQueue stop in parallel.
+Using the example above, AppService (Level 1) would stop first. After it has completed its shutdown, Database and MessageQueue (Level 0) would stop in parallel.
 
 ## Generating a Dependency Graph
 
@@ -108,16 +184,17 @@ Go offers several popular libraries for dependency injection and application lif
 | [uber/fx](https://github.com/uber-go/fx)           | `dig` + opinionated framework        | ⚪ Medium            | ⚫ Moderate       | ✅ Built-in start/stop hooks | High       |
 | [component](https://github.com/jacoelho/component) | Level-based, type-safe orchestration | ✅ High              | ⚪ Low            | ✅ Parallel start/stop       | Minimal    |
 
-- **google/wire**
-    - Uses compile-time code generation to wire dependencies.
-    - Zero runtime cost, but requires maintaining `wire.ProviderSet` definitions and rerunning `wire`.
-- **uber/dig**
-    - Relies on reflection to resolve constructor functions at runtime.
-    - Flexible and "plug-and-play", but introduces some reflection overhead and less explicit wiring.
-- **uber/fx**
-    - Builds on `dig` and adds an application framework with modules, hooks, and lifecycle hooks.
-    - Great for large, opinionated services, but comes with a larger API surface and more abstractions.
-- **Component**
-    - Emphasizes minimalism and idiomatic Go: uses zero-value `Key[T]`, generics, and simple maps.
-    - Validates dependencies at runtime, assigns each component a **level** (longest dependency chain), and starts/stops by level in parallel.
-    - Automatic rollback on startup failure ensures you never end up partially initialized.  
+- google/wire:
+  - Uses compile-time code generation to wire dependencies, offering excellent safety and zero runtime DI overhead.
+  - Requires maintaining wire.ProviderSet definitions and rerunning the wire tool. Does not manage lifecycles.
+- uber/dig:
+  - A powerful reflection-based DI container. Flexible and "plug-and-play."
+  - Type safety relies on constructor signatures; errors caught when the container is built. Introduces some reflection overhead. Does not manage lifecycles.
+- uber/fx:
+  - Builds upon dig to provide a full application framework with modules, hooks, and lifecycle management.
+  - Excellent for large, opinionated services but comes with a larger API surface and more abstractions.
+- jacoelho/component (this Library):
+  - Emphasizes minimalism, idiomatic Go (generics, simple interfaces), and explicit lifecycle control.
+  - Provides type-safe component registration and retrieval.
+  - Validates the dependency graph (cycles, missing dependencies) at runtime before starting components.
+  - Orchestrates Start and Stop calls in parallel by dependency level, with automatic rollback on startup failures and robust shutdown.
