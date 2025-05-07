@@ -15,6 +15,7 @@ type Lifecycle interface {
 
 	// Stop releases resources and terminates operations.
 	// Called in reverse dependency order during shutdown.
+	// Should not block.
 	Stop(context.Context) error
 }
 
