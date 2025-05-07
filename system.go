@@ -33,6 +33,9 @@ var (
 	// ErrAlreadyInitialized is returned when multiple component initializations
 	// are attempted.
 	ErrAlreadyInitialized = errors.New("already initialized")
+
+	// ErrPanic is returned when multiple component initialization or shutdown panics
+	ErrPanic = errors.New("component panicked")
 )
 
 type entry struct {
@@ -52,7 +55,7 @@ func Provide[T Lifecycle](
 	sys *System,
 	key Key[T],
 	fn func(*System) (T, error),
-	deps ...keyer,
+	deps ...Keyer,
 ) error {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
@@ -89,7 +92,7 @@ func Provide[T Lifecycle](
 func ProvideWithoutKey[T Lifecycle](
 	sys *System,
 	fn func(*System) (T, error),
-	deps ...keyer,
+	deps ...Keyer,
 ) error {
 	return Provide(sys, Key[T]{}, fn, deps...)
 }
@@ -145,19 +148,23 @@ func (sys *System) Start(ctx context.Context) error {
 
 // Stop tears down in descending‐level order, parallel within each level.
 func (sys *System) Stop(ctx context.Context) error {
+	sys.mu.Lock()
 	levels, err := computeLevels(sys.entries, false)
 	if err != nil {
+		sys.mu.Unlock()
 		return err
 	}
+	sys.mu.Unlock()
 
 	groups, maxLevel := groupByLevel(levels)
+
+	var errs []error
 	for level := maxLevel; level >= 0; level-- {
 		if err := sys.stopLevel(ctx, groups[level]); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-
-	return nil
+	return errors.Join(errs...)
 }
 
 // startLevel starts all entries in parallel and returns combined errors.
@@ -178,6 +185,12 @@ func (sys *System) startLevel(ctx context.Context, ids []string) error {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					ec.appendf("panic during start for %q %v: %w", id, r, ErrPanic)
+				}
+			}()
+
 			instance, err := ent.constructor(sys)
 			if err != nil {
 				ec.appendf("provide for %q: %w", id, err)
@@ -238,6 +251,11 @@ func (sys *System) stopLevel(ctx context.Context, ids []string) error {
 		wg.Add(1)
 		go func(lc Lifecycle, id string) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					ec.appendf("panic during stop for %q %v: %w", id, r, ErrPanic)
+				}
+			}()
 
 			if err := lc.Stop(ctx); err != nil {
 				ec.appendf("stop failed for %q: %w", id, err)
@@ -372,15 +390,13 @@ func computeLevels(
 }
 
 // formatCycle creates a human-readable cycle path
-func formatCycle(path []string, cycleEnd string) string {
-	var b strings.Builder
-	for i, t := range path {
-		if t == cycleEnd && i > 0 {
-			fmt.Fprintf(&b, "%v -> %v [CYCLE]", path[:i], cycleEnd)
-			return b.String()
-		}
+func formatCycle(dfsPath []string, repeatedNode string) string {
+	startIndex := slices.Index(dfsPath, repeatedNode)
+	if startIndex == -1 {
+		return strings.Join(append(dfsPath, repeatedNode), " -> ") + " (malformed cycle path)"
 	}
-	return fmt.Sprintf("%v -> %v", path, cycleEnd)
+	cyclePath := append(dfsPath[startIndex:], repeatedNode)
+	return strings.Join(cyclePath, " -> ")
 }
 
 // groupByLevel groups types by their level from the input map, returning

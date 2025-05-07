@@ -15,6 +15,7 @@ type Lifecycle interface {
 
 	// Stop releases resources and terminates operations.
 	// Called in reverse dependency order during shutdown.
+	// Should not block.
 	Stop(context.Context) error
 }
 
@@ -24,8 +25,8 @@ type Key[T Lifecycle] struct {
 }
 
 // NewKey returns a Key[T] with the given name.
-// name must be non-empty if you plan to have >1 Key[T] in your System.
-// Repeated names with different underlying T is allowed.
+// Used for disambiguating multiple instances of the same type T
+// If types are different, names can be the same or empty without collision.
 func NewKey[T Lifecycle](name string) Key[T] {
 	return Key[T]{name: name}
 }
@@ -42,18 +43,11 @@ func (k Key[T]) id() string {
 	return typ
 }
 
-// typ returns reflect.Type of T (used for type‐assertion on Get).
-func (Key[T]) typ() reflect.Type {
-	var zero T
-	return reflect.TypeOf(zero)
-}
-
 func (k Key[T]) String() string {
 	return k.id()
 }
 
-// keyer provides type erasure for heterogeneous component keys.
-type keyer interface {
+// Keyer provides type erasure for heterogeneous component keys.
+type Keyer interface {
 	id() string
-	typ() reflect.Type
 }
