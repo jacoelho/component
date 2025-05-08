@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/jacoelho/component/example/database"
@@ -16,8 +17,9 @@ import (
 // 1. Define components
 
 type MainService struct {
-	logger *logger.Logger
-	db     database.Database
+	logger         *logger.Logger
+	db             database.Database
+	isShuttingDown atomic.Bool
 }
 
 func (s *MainService) Start(ctx context.Context) error {
@@ -26,6 +28,9 @@ func (s *MainService) Start(ctx context.Context) error {
 }
 func (s *MainService) Stop(ctx context.Context) error {
 	s.logger.Log("stopping MainService")
+	s.isShuttingDown.Store(true)
+	time.Sleep(5 * time.Second)
+	// shutdown http server for example
 	return nil
 }
 
@@ -33,24 +38,20 @@ func main() {
 	sys := new(component.System)
 	ctx := context.Background()
 
-	// Create Keys
-	var (
-		serviceKey component.Key[*MainService]
-	)
-
-	// Provide components
 	if err := component.Provide(sys, logger.LoggerKey, logger.Provide); err != nil {
 		log.Fatalf("Failed to provide logger: %v", err)
 	}
+
 	if err := component.Provide(sys, database.DatabaseKey, mysql.Provide); err != nil {
 		log.Fatalf("Failed to provide database: %v", err)
 	}
 
-	if err := component.Provide(sys, serviceKey, func(s *component.System) (*MainService, error) {
-		log, err := component.Get(s, logger.LoggerKey) // Get dependency
+	if err := component.ProvideWithoutKey(sys, func(s *component.System) (*MainService, error) {
+		log, err := component.Get(s, logger.LoggerKey)
 		if err != nil {
 			return nil, err
 		}
+
 		db, err := component.Get(s, database.DatabaseKey)
 		if err != nil {
 			return nil, err
@@ -61,13 +62,13 @@ func main() {
 			db:     db,
 		}
 		return svc, nil
-	}, logger.LoggerKey, database.DatabaseKey); err != nil { // Declare dependency on loggerKey
+	}, logger.LoggerKey, database.DatabaseKey); err != nil {
 		log.Fatalf("Failed to provide main service: %v", err)
 	}
 
-	// Start system
 	fmt.Println("Starting system...")
-	startCtx, cancel := context.WithTimeout(ctx, time.Second*5)
+
+	startCtx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
 	if err := sys.Start(startCtx); err != nil {
 		log.Fatalf("System start failed: %v", err)
@@ -75,9 +76,10 @@ func main() {
 
 	fmt.Println("System is UP.")
 
-	// Stop system
 	fmt.Println("Stopping system...")
-	stopCtx, cancel := context.WithTimeout(ctx, time.Second*5)
+
+	stopCtx, cancel := context.WithTimeout(ctx, time.Second*10)
+
 	defer cancel()
 	if err := sys.Stop(stopCtx); err != nil {
 		log.Printf("System stop encountered errors: %v", err)
