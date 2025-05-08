@@ -101,7 +101,7 @@ func main() {
 }
 ```
 
-For a more detailed, runnable example demonstrating multiple components and dependencies, see [example_test.go](./example_test.go).
+For a more detailed, runnable example demonstrating multiple components and dependencies, see [example](./example/main.go).
 
 ## Startup & Shutdown Order
 

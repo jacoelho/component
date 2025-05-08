@@ -44,36 +44,18 @@ func TestStartupAndShutdownOrder(t *testing.T) {
 		t.Fatal("Start:", err)
 	}
 
-	events := collector.Events()
-
-	// Check that A:start and B:start both happen before C:start
-	idxA := slices.Index(events, "A:start")
-	idxB := slices.Index(events, "B:start")
-	idxC := slices.Index(events, "C:start")
-
-	if idxA < 0 || idxB < 0 || idxC < 0 {
-		t.Fatalf("missing start events, events: %v", events)
-	}
-	if idxA > idxC || idxB > idxC {
-		t.Errorf("level-0 must start before C; got order: %v", events)
-	}
-
 	if err := sys.Stop(ctx); err != nil {
 		t.Fatal("Stop:", err)
 	}
 
-	events = collector.Events()
+	expectedEvents := [][]string{
+		{"A:start", "B:start"},
+		{"C:start"},
+		{"C:stop"},
+		{"A:stop", "B:stop"},
+	}
 
-	// Check that C:stop happens before A:stop and B:stop
-	idxCStop := slices.Index(events, "C:stop")
-	idxAStop := slices.Index(events, "A:stop")
-	idxBStop := slices.Index(events, "B:stop")
-	if idxCStop < 0 || idxAStop < 0 || idxBStop < 0 {
-		t.Fatalf("missing stop events, events: %v", events)
-	}
-	if idxCStop > idxAStop || idxCStop > idxBStop {
-		t.Errorf("C must stop before level-0; got order: %v", events)
-	}
+	assertEventGroupsMatch(t, expectedEvents, collector.Events())
 }
 
 func TestCycleDetectionDirect(t *testing.T) {
@@ -315,18 +297,18 @@ func TestStopFailuresAndContinuation(t *testing.T) {
 	cKey := component.NewKey[*stubComponent]("C")
 
 	tests := []struct {
-		name                string
-		setup               func(sys *component.System, collector *eventCollector)
-		expectedError       error
-		expectedEventGroups [][]string
+		name           string
+		setup          func(sys *component.System, collector *eventCollector)
+		expectedError  error
+		expectedEvents [][]string
 	}{
 		{
 			name: "no components provided, stop does nothing",
 			setup: func(sys *component.System, collector *eventCollector) {
 				// No components provided
 			},
-			expectedError:       nil, // No error
-			expectedEventGroups: [][]string{},
+			expectedError:  nil, // No error
+			expectedEvents: [][]string{},
 		},
 		{
 			name: "one component fails to stop (level 0)",
@@ -339,7 +321,7 @@ func TestStopFailuresAndContinuation(t *testing.T) {
 				mustProvide(t, sys, bKey, func(_ *component.System) (*stubComponent, error) { return stubB, nil })
 			},
 			expectedError: errSentinel,
-			expectedEventGroups: [][]string{
+			expectedEvents: [][]string{
 				{
 					"B:stop",     // B stops successfully (parallel to A's attempt)
 					"A:stop-err", // A attempts stop and errors
@@ -358,7 +340,7 @@ func TestStopFailuresAndContinuation(t *testing.T) {
 				mustProvide(t, sys, bKey, func(_ *component.System) (*stubComponent, error) { return stubB, nil })
 			},
 			expectedError: errSentinel,
-			expectedEventGroups: [][]string{
+			expectedEvents: [][]string{
 				{"B:stop-err", "A:stop-err"},
 			},
 		},
@@ -373,7 +355,7 @@ func TestStopFailuresAndContinuation(t *testing.T) {
 				mustProvide(t, sys, bKey, func(_ *component.System) (*stubComponent, error) { return stubB, nil }, aKey)
 			},
 			expectedError: errSentinel,
-			expectedEventGroups: [][]string{
+			expectedEvents: [][]string{
 				{"B:stop-err"}, // B (level 1) stops first and errors
 				{"A:stop"},     // A (level 0) stops after B
 			},
@@ -389,7 +371,7 @@ func TestStopFailuresAndContinuation(t *testing.T) {
 				mustProvide(t, sys, bKey, func(_ *component.System) (*stubComponent, error) { return stubB, nil }, aKey)
 			},
 			expectedError: component.ErrPanic,
-			expectedEventGroups: [][]string{
+			expectedEvents: [][]string{
 				// B (level 1) panics before recording "stop"
 				{"A:stop"}, // A (level 0) stops after B's panic is handled
 			},
@@ -410,7 +392,7 @@ func TestStopFailuresAndContinuation(t *testing.T) {
 				mustProvide(t, sys, cKey, func(_ *component.System) (*stubComponent, error) { return stubC, nil }, aKey)
 			},
 			expectedError: errSentinel,
-			expectedEventGroups: [][]string{
+			expectedEvents: [][]string{
 				{"C:stop-err"}, // C (L1) fails
 				{
 					"B:stop",     // B (L0) succeeds
@@ -438,7 +420,7 @@ func TestStopFailuresAndContinuation(t *testing.T) {
 				t.Errorf("expected error %v, got %v", tc.expectedError, err)
 			}
 
-			assertEventGroupsMatch(t, tc.expectedEventGroups, collector.Events())
+			assertEventGroupsMatch(t, tc.expectedEvents, collector.Events())
 		})
 	}
 }
