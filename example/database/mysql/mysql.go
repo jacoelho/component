@@ -20,8 +20,8 @@ func (*MySQL) Stop(context.Context) error {
 	return nil
 }
 
-func (*MySQL) GetByID(context.Context, string) (string, error) {
-	return "postgres", nil
+func (*MySQL) GetByID(_ context.Context, id string) (string, error) {
+	return id, nil
 }
 
 func Provide(_ *component.System) (database.Database, error) {

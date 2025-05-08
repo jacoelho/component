@@ -20,8 +20,8 @@ func (*Postgres) Stop(context.Context) error {
 	return nil
 }
 
-func (*Postgres) GetByID(context.Context, string) (string, error) {
-	return "postgres", nil
+func (*Postgres) GetByID(_ context.Context, id string) (string, error) {
+	return id, nil
 }
 
 func Provide(_ *component.System) (database.Database, error) {
