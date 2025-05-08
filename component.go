@@ -33,13 +33,10 @@ func NewKey[T Lifecycle](name string) Key[T] {
 
 // id returns the unique string for this key.
 func (k Key[T]) id() string {
-	var zero T
-	typ := reflect.TypeOf(zero).String()
-
+	typ := reflect.TypeOf(new(T)).Elem().String()
 	if k.name != "" {
 		return fmt.Sprintf("%s(%s)", typ, k.name)
 	}
-
 	return typ
 }
 
