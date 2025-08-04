@@ -25,13 +25,13 @@ type Key[T Lifecycle] struct {
 }
 
 // NewKey returns a Key[T] with the given name.
-// Used for disambiguating multiple instances of the same type T
+// Used for disambiguating multiple instances of the same type T.
 // If types are different, names can be the same or empty without collision.
 func NewKey[T Lifecycle](name string) Key[T] {
 	return Key[T]{name: name}
 }
 
-// id returns the unique string for this key.
+// id returns the unique string identifier for this key.
 func (k Key[T]) id() string {
 	typ := reflect.TypeOf(new(T)).Elem().String()
 	if k.name != "" {
