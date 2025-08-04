@@ -7,11 +7,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jacoelho/component"
 	"github.com/jacoelho/component/example/database"
 	"github.com/jacoelho/component/example/database/mysql"
 	"github.com/jacoelho/component/example/logger"
-
-	"github.com/jacoelho/component"
 )
 
 // 1. Define components
