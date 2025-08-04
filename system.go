@@ -89,12 +89,6 @@ func (ec *errorCollector) errors() error {
 	return errors.Join(ec.errs...)
 }
 
-func (ec *errorCollector) hasErrors() bool {
-	ec.mu.Lock()
-	defer ec.mu.Unlock()
-	return len(ec.errs) > 0
-}
-
 type entry struct {
 	constructor  func(*System) (any, error)
 	instance     any
