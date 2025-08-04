@@ -151,7 +151,7 @@ func Provide[T Lifecycle](
 		dependencies: dependencies,
 	}
 
-	if _, err := computeLevels(sys.entries, true); err != nil {
+	if _, err := computeLevels(sys.entries, ignoreMissingDeps); err != nil {
 		return err
 	}
 
@@ -218,7 +218,7 @@ func (sys *System) Start(ctx context.Context) error {
 		return err
 	}
 
-	levels, err := computeLevels(sys.entries, false)
+	levels, err := computeLevels(sys.entries, strictValidation)
 	if err != nil {
 		sys.mu.Unlock()
 		return err
@@ -243,7 +243,7 @@ func (sys *System) Stop(ctx context.Context) error {
 	}
 
 	sys.mu.Lock()
-	levels, err := computeLevels(sys.entries, false)
+	levels, err := computeLevels(sys.entries, strictValidation)
 	if err != nil {
 		sys.mu.Unlock()
 		return err
@@ -384,27 +384,23 @@ func (sys *System) stopLevel(ctx context.Context, ids []string) error {
 
 // DotGraph outputs the system's dependency graph in Graphviz DOT format.
 // The graph shows components grouped by dependency levels and their relationships.
-// Returns an empty string and error if the dependency graph contains cycles.
 func (sys *System) DotGraph() (string, error) {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
 
-	levels, err := computeLevels(sys.entries, false)
+	levels, err := computeLevels(sys.entries, strictValidation)
 	if err != nil {
 		return "", err
 	}
 
 	levelGroups, highestLevel := groupByLevel(levels)
 
-	// Estimate buffer size for better performance
 	estimatedSize := len(sys.entries)*50 + 200 // rough estimate
 	var b strings.Builder
 	b.Grow(estimatedSize)
 
-	// Write DOT graph header
 	b.WriteString("digraph G {\n  rankdir=TB;\n  compound=true;\n")
 
-	// Build node mapping and subgraphs
 	nodeMap := make(map[string]string, len(sys.entries))
 	for level := 0; level <= highestLevel; level++ {
 		componentIDs := levelGroups[level]
@@ -412,14 +408,12 @@ func (sys *System) DotGraph() (string, error) {
 			continue
 		}
 
-		// Write subgraph header
 		b.WriteString("  subgraph cluster_")
 		b.WriteString(fmt.Sprintf("%d", level))
 		b.WriteString(" {\n    label=\"Level ")
 		b.WriteString(fmt.Sprintf("%d", level))
 		b.WriteString("\";\n    style=dashed;\n")
 
-		// Write nodes in this level
 		for _, id := range componentIDs {
 			quotedName := fmt.Sprintf("%q", id)
 			nodeMap[id] = quotedName
@@ -430,7 +424,6 @@ func (sys *System) DotGraph() (string, error) {
 		b.WriteString("  }\n")
 	}
 
-	// Write dependency edges
 	for componentID, entry := range sys.entries {
 		toNode := nodeMap[componentID]
 		for _, dependency := range entry.dependencies {
@@ -468,6 +461,14 @@ const (
 	visited
 )
 
+// validationMode controls how missing dependencies are handled during level computation
+type validationMode int
+
+const (
+	strictValidation validationMode = iota
+	ignoreMissingDeps
+)
+
 // buildCycleError constructs a detailed cycle error message
 func buildCycleError(id string, path []string) error {
 	cycleStart := -1
@@ -486,10 +487,10 @@ func buildCycleError(id string, path []string) error {
 }
 
 // computeLevels calculates the dependency depth for each component using recursive DFS.
-// Missing dependencies are treated as level 0 leaves when ignoreMissing=true.
+// Missing dependencies are treated as level 0 leaves when mode is ignoreMissingDeps.
 func computeLevels(
 	entries map[string]*entry,
-	ignoreMissing bool,
+	mode validationMode,
 ) (map[string]int, error) {
 	if len(entries) == 0 {
 		return make(map[string]int), nil
@@ -502,7 +503,7 @@ func computeLevels(
 	visit = func(id string, path []string) (int, error) {
 		ent, exists := entries[id]
 		if !exists {
-			if ignoreMissing {
+			if mode == ignoreMissingDeps {
 				return 0, nil // Treat as leaf node
 			}
 			return 0, fmt.Errorf("missing dependency %q: %w", id, ErrNotRegistered)
@@ -520,7 +521,7 @@ func computeLevels(
 		currentPath := append(path, id)
 
 		for _, dep := range ent.dependencies {
-			if _, exists := entries[dep]; !exists && ignoreMissing {
+			if _, exists := entries[dep]; !exists && mode == ignoreMissingDeps {
 				maxDepth = max(maxDepth, 1)
 				continue
 			}
