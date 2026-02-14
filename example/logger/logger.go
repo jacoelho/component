@@ -25,6 +25,6 @@ func (l *Logger) Log(message string) {
 	fmt.Println("Log message: ", message)
 }
 
-func Provide(_ *component.System) (*Logger, error) {
+func Provide(_ *component.Runtime) (*Logger, error) {
 	return &Logger{}, nil
 }

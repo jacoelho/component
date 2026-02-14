@@ -9,17 +9,22 @@ import (
 // Lifecycle defines the temporal boundaries of a component's operation.
 // Implementations should ensure Stop is idempotent and cleans up after Start.
 type Lifecycle interface {
-	// Start initializes long-lived resources. Called in dependency order.
-	// Should not block.
+	// Start initializes long-lived resources.
+	// It is called after dependencies have started and should return when
+	// initialization is complete.
 	Start(context.Context) error
 
 	// Stop releases resources and terminates operations.
-	// Called in reverse dependency order during shutdown.
-	// Should not block.
+	// It is called in reverse dependency order and should return when cleanup
+	// is complete.
 	Stop(context.Context) error
 }
 
-// Key identifies a component producing type T in the system.
+// Constructor creates a component instance for a runtime.
+// Use Get inside constructors to retrieve already-started dependencies.
+type Constructor[T Lifecycle] func(*Runtime) (T, error)
+
+// Key identifies a component producing type T in the registry.
 type Key[T Lifecycle] struct {
 	name string
 }
@@ -33,7 +38,7 @@ func NewKey[T Lifecycle](name string) Key[T] {
 
 // id returns the unique string identifier for this key.
 func (k Key[T]) id() string {
-	typ := reflect.TypeOf(new(T)).Elem().String()
+	typ := reflect.TypeFor[T]().String()
 	if k.name != "" {
 		return fmt.Sprintf("%s(%s)", typ, k.name)
 	}
