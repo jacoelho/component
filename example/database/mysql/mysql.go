@@ -24,6 +24,6 @@ func (*MySQL) GetByID(_ context.Context, id string) (string, error) {
 	return id, nil
 }
 
-func Provide(_ *component.System) (database.Database, error) {
+func Provide(_ *component.Runtime) (database.Database, error) {
 	return &MySQL{}, nil
 }

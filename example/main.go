@@ -25,6 +25,7 @@ func (s *MainService) Start(ctx context.Context) error {
 	s.logger.Log("starting MainService")
 	return nil
 }
+
 func (s *MainService) Stop(ctx context.Context) error {
 	s.logger.Log("stopping MainService")
 	s.isShuttingDown.Store(true)
@@ -34,30 +35,31 @@ func (s *MainService) Stop(ctx context.Context) error {
 }
 
 func main() {
-	sys := new(component.System)
 	ctx := context.Background()
+	reg := component.NewRegistry()
 
-	if err := component.Provide(sys, logger.LoggerKey, logger.Provide); err != nil {
+	if err := component.Provide(reg, logger.LoggerKey, logger.Provide); err != nil {
 		log.Fatalf("Failed to provide logger: %v", err)
 	}
 
-	if err := component.Provide(sys, database.DatabaseKey, mysql.Provide); err != nil {
+	if err := component.Provide(reg, database.DatabaseKey, mysql.Provide); err != nil {
 		log.Fatalf("Failed to provide database: %v", err)
 	}
 
-	if err := component.ProvideWithoutKey(sys, func(s *component.System) (*MainService, error) {
-		log, err := component.Get(s, logger.LoggerKey)
+	mainServiceKey := component.NewKey[*MainService]("main")
+	if err := component.Provide(reg, mainServiceKey, func(rt *component.Runtime) (*MainService, error) {
+		logComp, err := component.Get(rt, logger.LoggerKey)
 		if err != nil {
 			return nil, err
 		}
 
-		db, err := component.Get(s, database.DatabaseKey)
+		db, err := component.Get(rt, database.DatabaseKey)
 		if err != nil {
 			return nil, err
 		}
 
 		svc := &MainService{
-			logger: log,
+			logger: logComp,
 			db:     db,
 		}
 		return svc, nil
@@ -65,23 +67,29 @@ func main() {
 		log.Fatalf("Failed to provide main service: %v", err)
 	}
 
-	fmt.Println("Starting system...")
-
-	startCtx, cancel := context.WithTimeout(ctx, time.Second*10)
-	defer cancel()
-	if err := sys.Start(startCtx); err != nil {
-		log.Fatalf("System start failed: %v", err)
+	plan, err := reg.Compile()
+	if err != nil {
+		log.Fatalf("Failed to compile plan: %v", err)
 	}
 
-	fmt.Println("System is UP.")
+	rt := plan.NewRuntime()
 
-	fmt.Println("Stopping system...")
+	fmt.Println("Starting runtime...")
 
-	stopCtx, cancel := context.WithTimeout(ctx, time.Second*10)
-
+	startCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err := sys.Stop(stopCtx); err != nil {
-		log.Printf("System stop encountered errors: %v", err)
+	if err := rt.Start(startCtx); err != nil {
+		log.Fatalf("Runtime start failed: %v", err)
 	}
-	fmt.Println("System shut down.")
+
+	fmt.Println("Runtime is UP.")
+
+	fmt.Println("Stopping runtime...")
+
+	stopCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := rt.Stop(stopCtx); err != nil {
+		log.Printf("Runtime stop encountered errors: %v", err)
+	}
+	fmt.Println("Runtime shut down.")
 }

@@ -11,13 +11,13 @@ import (
 type Database struct{ DSN string }
 
 func (db *Database) Start(ctx context.Context) error {
-	time.Sleep(time.Millisecond * 100)
+	time.Sleep(100 * time.Millisecond)
 	fmt.Println("↳ DB connect:", db.DSN)
 	return nil
 }
 
 func (db *Database) Stop(ctx context.Context) error {
-	time.Sleep(time.Millisecond * 100)
+	time.Sleep(100 * time.Millisecond)
 	fmt.Println("↳ DB close")
 	return nil
 }
@@ -25,13 +25,13 @@ func (db *Database) Stop(ctx context.Context) error {
 type MessageQueue struct{ URL string }
 
 func (mq *MessageQueue) Start(ctx context.Context) error {
-	time.Sleep(time.Millisecond * 200)
+	time.Sleep(200 * time.Millisecond)
 	fmt.Println("↳ MQ connect:", mq.URL)
 	return nil
 }
 
 func (mq *MessageQueue) Stop(ctx context.Context) error {
-	time.Sleep(time.Millisecond * 200)
+	time.Sleep(200 * time.Millisecond)
 	fmt.Println("↳ MQ close")
 	return nil
 }
@@ -53,42 +53,47 @@ func (a *AppService) Stop(ctx context.Context) error {
 
 func Example() {
 	ctx := context.Background()
-	sys := new(component.System)
+	reg := component.NewRegistry()
 
 	var (
-		DBKey  component.Key[*Database]
-		MQKey  component.Key[*MessageQueue]
-		AppKey component.Key[*AppService]
+		dbKey  = component.NewKey[*Database]("db")
+		mqKey  = component.NewKey[*MessageQueue]("mq")
+		appKey = component.NewKey[*AppService]("app")
 	)
 
-	// Provide components and wire walkDependencies
-	component.Provide(sys, DBKey, func(sys *component.System) (*Database, error) {
+	// Provide components and declare dependencies.
+	_ = component.Provide(reg, dbKey, func(rt *component.Runtime) (*Database, error) {
 		return &Database{DSN: "postgres://..."}, nil
 	})
-	component.Provide(sys, MQKey, func(_ *component.System) (*MessageQueue, error) {
+	_ = component.Provide(reg, mqKey, func(_ *component.Runtime) (*MessageQueue, error) {
 		return &MessageQueue{URL: "amqp://..."}, nil
 	})
-	component.Provide(sys, AppKey, func(s *component.System) (*AppService, error) {
-		db, err := component.Get(s, DBKey)
+	_ = component.Provide(reg, appKey, func(rt *component.Runtime) (*AppService, error) {
+		db, err := component.Get(rt, dbKey)
 		if err != nil {
 			return nil, err
 		}
-		mq, err := component.Get(s, MQKey)
+		mq, err := component.Get(rt, mqKey)
 		if err != nil {
 			return nil, err
 		}
 		return &AppService{DB: db, MQ: mq}, nil
-	}, DBKey, MQKey)
+	}, dbKey, mqKey)
 
-	// Start all components (parallel within each dependency-level)
-	if err := sys.Start(ctx); err != nil {
+	plan, err := reg.Compile()
+	if err != nil {
 		panic(err)
 	}
 
-	fmt.Println("▶ system is UP")
+	rt := plan.NewRuntime()
 
-	// Stop all components in reverse order (parallel within each dependency-level)
-	if err := sys.Stop(ctx); err != nil {
+	if err := rt.Start(ctx); err != nil {
+		panic(err)
+	}
+
+	fmt.Println("▶ runtime is UP")
+
+	if err := rt.Stop(ctx); err != nil {
 		return
 	}
 
@@ -96,7 +101,7 @@ func Example() {
 	//↳ DB connect: postgres://...
 	//↳ MQ connect: amqp://...
 	//↳ AppService ready with DB & MQ
-	//▶ system is UP
+	//▶ runtime is UP
 	//↳ AppService stopping
 	//↳ DB close
 	//↳ MQ close

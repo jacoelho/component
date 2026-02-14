@@ -19,7 +19,11 @@ type Lifecycle interface {
 	Stop(context.Context) error
 }
 
-// Key identifies a component producing type T in the system.
+// Constructor creates a component instance for a runtime.
+// Use Get inside constructors to retrieve already-started dependencies.
+type Constructor[T Lifecycle] func(*Runtime) (T, error)
+
+// Key identifies a component producing type T in the registry.
 type Key[T Lifecycle] struct {
 	name string
 }
@@ -33,7 +37,7 @@ func NewKey[T Lifecycle](name string) Key[T] {
 
 // id returns the unique string identifier for this key.
 func (k Key[T]) id() string {
-	typ := reflect.TypeOf(new(T)).Elem().String()
+	typ := reflect.TypeFor[T]().String()
 	if k.name != "" {
 		return fmt.Sprintf("%s(%s)", typ, k.name)
 	}
