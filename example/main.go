@@ -13,8 +13,6 @@ import (
 	"github.com/jacoelho/component/example/logger"
 )
 
-// 1. Define components
-
 type MainService struct {
 	logger         *logger.Logger
 	db             database.Database
@@ -30,7 +28,6 @@ func (s *MainService) Stop(ctx context.Context) error {
 	s.logger.Log("stopping MainService")
 	s.isShuttingDown.Store(true)
 	time.Sleep(5 * time.Second)
-	// shutdown http server for example
 	return nil
 }
 

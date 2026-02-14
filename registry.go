@@ -16,6 +16,7 @@ type Registry struct {
 	entries map[string]*componentSpec
 }
 
+// NewRegistry creates an empty component registry.
 func NewRegistry() *Registry {
 	return &Registry{
 		entries: make(map[string]*componentSpec),

@@ -23,7 +23,8 @@ type Runtime struct {
 	fsm         *runtime.LifecycleFSM
 }
 
-// Get returns the started instance for key.
+// Get returns the available instance for key.
+// Retrieval is allowed only while runtime startup is in progress or completed.
 func Get[T Lifecycle](rt *Runtime, key Key[T]) (T, error) {
 	var zero T
 

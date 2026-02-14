@@ -9,13 +9,14 @@ import (
 // Lifecycle defines the temporal boundaries of a component's operation.
 // Implementations should ensure Stop is idempotent and cleans up after Start.
 type Lifecycle interface {
-	// Start initializes long-lived resources. Called in dependency order.
-	// Should not block.
+	// Start initializes long-lived resources.
+	// It is called after dependencies have started and should return when
+	// initialization is complete.
 	Start(context.Context) error
 
 	// Stop releases resources and terminates operations.
-	// Called in reverse dependency order during shutdown.
-	// Should not block.
+	// It is called in reverse dependency order and should return when cleanup
+	// is complete.
 	Stop(context.Context) error
 }
 

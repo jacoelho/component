@@ -10,14 +10,39 @@ import (
 
 type Database struct{ DSN string }
 
+const (
+	dbStartDelay  = 250 * time.Millisecond
+	dbStopDelay   = 120 * time.Millisecond
+	mqStartDelay  = 450 * time.Millisecond
+	mqStopDelay   = 180 * time.Millisecond
+	appStartDelay = 80 * time.Millisecond
+	appStopDelay  = 60 * time.Millisecond
+)
+
+func waitLatency(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func (db *Database) Start(ctx context.Context) error {
-	time.Sleep(100 * time.Millisecond)
+	if err := waitLatency(ctx, dbStartDelay); err != nil {
+		return err
+	}
 	fmt.Println("↳ DB connect:", db.DSN)
 	return nil
 }
 
 func (db *Database) Stop(ctx context.Context) error {
-	time.Sleep(100 * time.Millisecond)
+	if err := waitLatency(ctx, dbStopDelay); err != nil {
+		return err
+	}
 	fmt.Println("↳ DB close")
 	return nil
 }
@@ -25,13 +50,17 @@ func (db *Database) Stop(ctx context.Context) error {
 type MessageQueue struct{ URL string }
 
 func (mq *MessageQueue) Start(ctx context.Context) error {
-	time.Sleep(200 * time.Millisecond)
+	if err := waitLatency(ctx, mqStartDelay); err != nil {
+		return err
+	}
 	fmt.Println("↳ MQ connect:", mq.URL)
 	return nil
 }
 
 func (mq *MessageQueue) Stop(ctx context.Context) error {
-	time.Sleep(200 * time.Millisecond)
+	if err := waitLatency(ctx, mqStopDelay); err != nil {
+		return err
+	}
 	fmt.Println("↳ MQ close")
 	return nil
 }
@@ -42,11 +71,17 @@ type AppService struct {
 }
 
 func (a *AppService) Start(ctx context.Context) error {
+	if err := waitLatency(ctx, appStartDelay); err != nil {
+		return err
+	}
 	fmt.Println("↳ AppService ready with DB & MQ")
 	return nil
 }
 
 func (a *AppService) Stop(ctx context.Context) error {
+	if err := waitLatency(ctx, appStopDelay); err != nil {
+		return err
+	}
 	fmt.Println("↳ AppService stopping")
 	return nil
 }
