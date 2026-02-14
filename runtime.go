@@ -20,6 +20,7 @@ type Runtime struct {
 	entries     map[string]*runtimeEntry
 	levelGroups [][]string
 	state       runtime.State
+	fsm         *runtime.LifecycleFSM
 }
 
 // Get returns the started instance for key.
@@ -69,21 +70,25 @@ func (rt *Runtime) Start(ctx context.Context) error {
 		return fmt.Errorf("context cannot be nil")
 	}
 
-	if err := rt.beginStart(); err != nil {
+	if err := rt.beginStartTransaction(); err != nil {
 		return err
 	}
 
 	for level, ids := range rt.levelGroups {
 		if err := rt.startLevel(ctx, ids); err != nil {
-			rt.setState(runtime.StateStartFailed)
-
+			transitionErr := rt.completeTransition(runtime.EventStartFailed)
 			rollbackErr := rt.stopThroughLevel(ctx, level)
-			return errors.Join(err, rollbackErr)
+			rollbackEvent := runtime.EventStartRollbackFailed
+			if rollbackErr == nil {
+				rollbackEvent = runtime.EventStartRollbackSucceeded
+			}
+
+			rollbackTransitionErr := rt.completeTransition(rollbackEvent)
+			return errors.Join(err, transitionErr, rollbackErr, rollbackTransitionErr)
 		}
 	}
 
-	rt.setState(runtime.StateStarted)
-	return nil
+	return rt.completeTransition(runtime.EventStartSucceeded)
 }
 
 // Stop stops all started components in reverse level order.
@@ -95,7 +100,7 @@ func (rt *Runtime) Stop(ctx context.Context) error {
 		return fmt.Errorf("context cannot be nil")
 	}
 
-	if err := rt.beginStop(); err != nil {
+	if err := rt.beginStopTransaction(); err != nil {
 		return err
 	}
 
@@ -109,15 +114,14 @@ func (rt *Runtime) Stop(ctx context.Context) error {
 	aggErr := errors.Join(errs...)
 
 	if aggErr != nil {
-		rt.setState(runtime.StateStopFailed)
-	} else {
-		rt.setState(runtime.StateStopped)
+		transitionErr := rt.completeTransition(runtime.EventStopFailed)
+		return errors.Join(aggErr, transitionErr)
 	}
 
-	return aggErr
+	return rt.completeTransition(runtime.EventStopSucceeded)
 }
 
-func (rt *Runtime) beginStart() error {
+func (rt *Runtime) beginStartTransaction() error {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
@@ -125,34 +129,78 @@ func (rt *Runtime) beginStart() error {
 		rt.entries = make(map[string]*runtimeEntry)
 	}
 
-	switch rt.state {
-	case runtime.StateIdle, runtime.StateStopped:
-		rt.state = runtime.StateStarting
-		return nil
-	case runtime.StateStarted:
-		return fmt.Errorf("runtime already started: %w", ErrAlreadyStarted)
-	default:
-		return fmt.Errorf("cannot start runtime from %q: %w", rt.state, ErrInvalidStateTransition)
+	action, err := rt.transitionLocked(runtime.EventStartRequested)
+	if err != nil {
+		return err
 	}
+	if action != runtime.ActionRunStart {
+		return fmt.Errorf("unexpected lifecycle action for start request: %s", action)
+	}
+
+	return nil
 }
 
-func (rt *Runtime) beginStop() error {
+func (rt *Runtime) beginStopTransaction() error {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
-	switch rt.state {
-	case runtime.StateStarted, runtime.StateStartFailed:
-		rt.state = runtime.StateStopping
-		return nil
-	default:
-		return fmt.Errorf("cannot stop runtime from %q: %w", rt.state, ErrInvalidStateTransition)
+	action, err := rt.transitionLocked(runtime.EventStopRequested)
+	if err != nil {
+		return err
 	}
+	if action != runtime.ActionRunStop {
+		return fmt.Errorf("unexpected lifecycle action for stop request: %s", action)
+	}
+
+	return nil
 }
 
-func (rt *Runtime) setState(next runtime.State) {
+func (rt *Runtime) completeTransition(event runtime.Event) error {
 	rt.mu.Lock()
+	defer rt.mu.Unlock()
+
+	action, err := rt.transitionLocked(event)
+	if err != nil {
+		return err
+	}
+	if action != runtime.ActionNone {
+		return fmt.Errorf("unexpected lifecycle action for completion event %s: %s", event, action)
+	}
+
+	return nil
+}
+
+func (rt *Runtime) transitionLocked(event runtime.Event) (runtime.Action, error) {
+	if rt.fsm == nil {
+		rt.fsm = runtime.NewLifecycleFSM()
+	}
+
+	current := rt.state
+	next, action, err := rt.fsm.Transition(current, event)
+	if err != nil {
+		return runtime.ActionNone, mapTransitionError(current, event, err)
+	}
+
 	rt.state = next
-	rt.mu.Unlock()
+	return action, nil
+}
+
+func mapTransitionError(state runtime.State, event runtime.Event, err error) error {
+	switch {
+	case errors.Is(err, runtime.ErrAlreadyStartedTransition):
+		return fmt.Errorf("runtime already started: %w", ErrAlreadyStarted)
+	case errors.Is(err, runtime.ErrInvalidTransition):
+		switch event {
+		case runtime.EventStartRequested:
+			return fmt.Errorf("cannot start runtime from %q: %w", state, ErrInvalidStateTransition)
+		case runtime.EventStopRequested:
+			return fmt.Errorf("cannot stop runtime from %q: %w", state, ErrInvalidStateTransition)
+		default:
+			return fmt.Errorf("invalid runtime transition from %q on %s: %w", state, event, err)
+		}
+	default:
+		return err
+	}
 }
 
 func (rt *Runtime) startLevel(ctx context.Context, ids []string) error {

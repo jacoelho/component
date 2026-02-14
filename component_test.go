@@ -313,6 +313,85 @@ func TestStartFailuresAndRollback(t *testing.T) {
 	}
 }
 
+func TestStartRetryAfterSuccessfulRollback(t *testing.T) {
+	errSentinel := errors.New("forced start error")
+	reg := component.NewRegistry()
+	ctx := context.Background()
+	collector := new(eventCollector)
+
+	aKey := component.NewKey[*stubComponent]("A")
+	bKey := component.NewKey[*stubComponent]("B")
+
+	stubA := newStub("A", collector)
+	stubB := newStub("B", collector)
+	stubB.startErr = errSentinel
+
+	mustProvide(t, reg, aKey, func(_ *component.Runtime) (*stubComponent, error) { return stubA, nil })
+	mustProvide(t, reg, bKey, func(_ *component.Runtime) (*stubComponent, error) { return stubB, nil }, aKey)
+
+	rt := mustCompileRuntime(t, reg)
+
+	err := rt.Start(ctx)
+	if !errors.Is(err, errSentinel) {
+		t.Fatalf("expected first start error %v, got %v", errSentinel, err)
+	}
+
+	if events := collector.Events(); !slices.Equal(events, []string{"A:start", "B:start-err", "A:stop"}) {
+		t.Fatalf("unexpected events after failed start rollback: %v", events)
+	}
+
+	stubB.startErr = nil
+	collector.Clear()
+
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("expected retry start to succeed after rollback, got %v", err)
+	}
+
+	if events := collector.Events(); !slices.Equal(events, []string{"A:start", "B:start"}) {
+		t.Fatalf("unexpected events after successful retry start: %v", events)
+	}
+
+	if err := rt.Stop(ctx); err != nil {
+		t.Fatalf("stop after retry start failed: %v", err)
+	}
+}
+
+func TestStartFailureWithRollbackFailureRequiresStopRecovery(t *testing.T) {
+	startErr := errors.New("forced start error")
+	rollbackStopErr := errors.New("forced rollback stop error")
+	reg := component.NewRegistry()
+	ctx := context.Background()
+	collector := new(eventCollector)
+
+	aKey := component.NewKey[*stubComponent]("A")
+	bKey := component.NewKey[*stubComponent]("B")
+
+	stubA := newStub("A", collector)
+	stubA.stopErr = rollbackStopErr
+	stubB := newStub("B", collector)
+	stubB.startErr = startErr
+
+	mustProvide(t, reg, aKey, func(_ *component.Runtime) (*stubComponent, error) { return stubA, nil })
+	mustProvide(t, reg, bKey, func(_ *component.Runtime) (*stubComponent, error) { return stubB, nil }, aKey)
+
+	rt := mustCompileRuntime(t, reg)
+
+	err := rt.Start(ctx)
+	if !errors.Is(err, startErr) || !errors.Is(err, rollbackStopErr) {
+		t.Fatalf("expected joined start/rollback errors, got %v", err)
+	}
+
+	stubB.startErr = nil
+	if err := rt.Start(ctx); !errors.Is(err, component.ErrInvalidStateTransition) {
+		t.Fatalf("expected invalid transition retrying start after failed rollback, got %v", err)
+	}
+
+	stubA.stopErr = nil
+	if err := rt.Stop(ctx); err != nil {
+		t.Fatalf("stop should recover runtime from failed_start, got %v", err)
+	}
+}
+
 func TestStopFailuresAndContinuation(t *testing.T) {
 	errSentinel := errors.New("forced error")
 	aKey := component.NewKey[*stubComponent]("A")
@@ -431,6 +510,40 @@ func TestStopFailuresAndContinuation(t *testing.T) {
 
 			assertEventGroupsMatch(t, tc.expectedEvents, collector.Events())
 		})
+	}
+}
+
+func TestStopRetryAfterTransientFailure(t *testing.T) {
+	errSentinel := errors.New("transient stop error")
+	reg := component.NewRegistry()
+	ctx := context.Background()
+	collector := new(eventCollector)
+
+	aKey := component.NewKey[*stubComponent]("A")
+	stubA := newStub("A", collector)
+	stubA.stopErr = errSentinel
+
+	mustProvide(t, reg, aKey, func(_ *component.Runtime) (*stubComponent, error) { return stubA, nil })
+
+	rt := mustCompileRuntime(t, reg)
+
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+
+	collector.Clear()
+
+	if err := rt.Stop(ctx); !errors.Is(err, errSentinel) {
+		t.Fatalf("expected stop failure %v, got %v", errSentinel, err)
+	}
+
+	stubA.stopErr = nil
+	if err := rt.Stop(ctx); err != nil {
+		t.Fatalf("expected stop retry to succeed from failed_stop state, got %v", err)
+	}
+
+	if events := collector.Events(); !slices.Equal(events, []string{"A:stop-err", "A:stop"}) {
+		t.Fatalf("unexpected stop retry events: %v", events)
 	}
 }
 

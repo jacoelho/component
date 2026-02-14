@@ -19,6 +19,7 @@ func (p *Plan) NewRuntime() *Runtime {
 	rt := &Runtime{
 		entries: make(map[string]*runtimeEntry),
 		state:   runtime.StateIdle,
+		fsm:     runtime.NewLifecycleFSM(),
 	}
 
 	if p == nil {

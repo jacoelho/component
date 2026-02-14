@@ -9,8 +9,8 @@ const (
 	StateStarted
 	StateStopping
 	StateStopped
-	StateStartFailed
-	StateStopFailed
+	StateFailedStart
+	StateFailedStop
 )
 
 func (s State) String() string {
@@ -25,10 +25,10 @@ func (s State) String() string {
 		return "stopping"
 	case StateStopped:
 		return "stopped"
-	case StateStartFailed:
-		return "start_failed"
-	case StateStopFailed:
-		return "stop_failed"
+	case StateFailedStart:
+		return "failedStart"
+	case StateFailedStop:
+		return "failedStop"
 	default:
 		return "unknown"
 	}
