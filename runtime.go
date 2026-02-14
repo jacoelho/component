@@ -39,6 +39,12 @@ func Get[T Lifecycle](rt *Runtime, key Key[T]) (T, error) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
+	switch rt.state {
+	case runtime.StateStarting, runtime.StateStarted:
+	default:
+		return zero, wrapComponentError(id, fmt.Sprintf("not available in state %q", rt.state), ErrNotStarted)
+	}
+
 	ent, ok := rt.entries[id]
 	if !ok {
 		return zero, wrapRetrievalError(id, ErrNotRegistered)

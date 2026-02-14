@@ -229,6 +229,77 @@ func TestGet(t *testing.T) {
 	}
 }
 
+func TestGetDeniedWhenStopping(t *testing.T) {
+	reg := component.NewRegistry()
+	ctx := context.Background()
+	collector := new(eventCollector)
+
+	aKey := component.NewKey[*blockingStopComponent]("A")
+	allowStop := make(chan struct{})
+	stopEntered := make(chan struct{})
+
+	mustProvide(t, reg, aKey, func(_ *component.Runtime) (*blockingStopComponent, error) {
+		return &blockingStopComponent{
+			name:        "A",
+			collector:   collector,
+			stopEntered: stopEntered,
+			allowStop:   allowStop,
+		}, nil
+	})
+
+	rt := mustCompileRuntime(t, reg)
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- rt.Stop(ctx)
+	}()
+
+	select {
+	case <-stopEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for component to enter stop")
+	}
+
+	_, err := component.Get(rt, aKey)
+	if want := component.ErrNotStarted; !errors.Is(err, want) {
+		t.Fatalf("expected %v while stopping, got %v", want, err)
+	}
+
+	close(allowStop)
+	if err := <-stopDone; err != nil {
+		t.Fatalf("stop failed: %v", err)
+	}
+}
+
+func TestGetDeniedAfterFailedStop(t *testing.T) {
+	reg := component.NewRegistry()
+	ctx := context.Background()
+	collector := new(eventCollector)
+	errSentinel := errors.New("forced stop failure")
+
+	aKey := component.NewKey[*stubComponent]("A")
+	stubA := newStub("A", collector)
+	stubA.stopErr = errSentinel
+	mustProvide(t, reg, aKey, func(_ *component.Runtime) (*stubComponent, error) { return stubA, nil })
+
+	rt := mustCompileRuntime(t, reg)
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+
+	if err := rt.Stop(ctx); !errors.Is(err, errSentinel) {
+		t.Fatalf("expected stop failure %v, got %v", errSentinel, err)
+	}
+
+	_, err := component.Get(rt, aKey)
+	if want := component.ErrNotStarted; !errors.Is(err, want) {
+		t.Fatalf("expected %v after failed stop, got %v", want, err)
+	}
+}
+
 func TestStartFailuresAndRollback(t *testing.T) {
 	errSentinel := errors.New("forced error")
 	aKey := component.NewKey[*stubComponent]("A")
@@ -660,6 +731,17 @@ func TestDotGraphDeterministic(t *testing.T) {
 	}
 }
 
+func TestNilPlanNewRuntime(t *testing.T) {
+	var plan *component.Plan
+	rt, err := plan.NewRuntime()
+	if !errors.Is(err, component.ErrNilPlan) {
+		t.Fatalf("expected %v, got %v", component.ErrNilPlan, err)
+	}
+	if rt != nil {
+		t.Fatalf("expected nil runtime for nil plan")
+	}
+}
+
 type eventCollector struct {
 	mu     sync.Mutex
 	events []string
@@ -741,6 +823,26 @@ func (b *blockingComponent) Stop(_ context.Context) error {
 	return nil
 }
 
+type blockingStopComponent struct {
+	name        string
+	collector   *eventCollector
+	stopEntered chan struct{}
+	allowStop   chan struct{}
+	once        sync.Once
+}
+
+func (b *blockingStopComponent) Start(_ context.Context) error {
+	b.collector.Record(b.name, "start")
+	return nil
+}
+
+func (b *blockingStopComponent) Stop(_ context.Context) error {
+	b.once.Do(func() { close(b.stopEntered) })
+	<-b.allowStop
+	b.collector.Record(b.name, "stop")
+	return nil
+}
+
 func mustProvide[T component.Lifecycle](
 	t *testing.T,
 	reg *component.Registry,
@@ -760,7 +862,11 @@ func mustCompileRuntime(t *testing.T, reg *component.Registry) *component.Runtim
 	if err != nil {
 		t.Fatalf("Compile failed: %v", err)
 	}
-	return plan.NewRuntime()
+	rt, err := plan.NewRuntime()
+	if err != nil {
+		t.Fatalf("NewRuntime failed: %v", err)
+	}
+	return rt
 }
 
 // assertEventGroupsMatch checks if the actual events match the expected event groups.

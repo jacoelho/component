@@ -33,6 +33,9 @@ var (
 
 	// ErrInvalidStateTransition is returned when Start/Stop is called from an invalid state.
 	ErrInvalidStateTransition = errors.New("invalid state transition")
+
+	// ErrNilPlan is returned when trying to create a runtime from a nil plan.
+	ErrNilPlan = errors.New("nil plan")
 )
 
 func wrapComponentError(componentID string, operation string, err error) error {

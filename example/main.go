@@ -72,7 +72,10 @@ func main() {
 		log.Fatalf("Failed to compile plan: %v", err)
 	}
 
-	rt := plan.NewRuntime()
+	rt, err := plan.NewRuntime()
+	if err != nil {
+		log.Fatalf("Failed to create runtime: %v", err)
+	}
 
 	fmt.Println("Starting runtime...")
 

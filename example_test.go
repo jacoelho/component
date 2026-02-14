@@ -85,7 +85,10 @@ func Example() {
 		panic(err)
 	}
 
-	rt := plan.NewRuntime()
+	rt, err := plan.NewRuntime()
+	if err != nil {
+		panic(err)
+	}
 
 	if err := rt.Start(ctx); err != nil {
 		panic(err)

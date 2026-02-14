@@ -15,15 +15,15 @@ type Plan struct {
 }
 
 // NewRuntime creates a fresh runtime instance for this plan.
-func (p *Plan) NewRuntime() *Runtime {
+func (p *Plan) NewRuntime() (*Runtime, error) {
+	if p == nil {
+		return nil, ErrNilPlan
+	}
+
 	rt := &Runtime{
 		entries: make(map[string]*runtimeEntry),
 		state:   runtime.StateIdle,
 		fsm:     runtime.NewLifecycleFSM(),
-	}
-
-	if p == nil {
-		return rt
 	}
 
 	rt.levelGroups = make([][]string, len(p.levelGroups))
@@ -38,7 +38,7 @@ func (p *Plan) NewRuntime() *Runtime {
 		rt.levelGroups[level] = slices.Clone(ids)
 	}
 
-	return rt
+	return rt, nil
 }
 
 // DotGraph outputs the plan dependency graph in Graphviz DOT format.
