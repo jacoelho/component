@@ -463,6 +463,72 @@ func TestStartFailureWithRollbackFailureRequiresStopRecovery(t *testing.T) {
 	}
 }
 
+func TestStopRejectedWhileStartRollbackInProgress(t *testing.T) {
+	startErr := errors.New("forced start error")
+	reg := component.NewRegistry()
+	ctx := context.Background()
+	collector := new(eventCollector)
+
+	aKey := component.NewKey[*blockingStopComponent]("A")
+	bKey := component.NewKey[*stubComponent]("B")
+
+	stopEntered := make(chan struct{})
+	allowStop := make(chan struct{})
+
+	stubA := &blockingStopComponent{
+		name:        "A",
+		collector:   collector,
+		stopEntered: stopEntered,
+		allowStop:   allowStop,
+	}
+	stubB := newStub("B", collector)
+	stubB.startErr = startErr
+
+	mustProvide(t, reg, aKey, func(_ *component.Runtime) (*blockingStopComponent, error) { return stubA, nil })
+	mustProvide(t, reg, bKey, func(_ *component.Runtime) (*stubComponent, error) { return stubB, nil }, aKey)
+
+	rt := mustCompileRuntime(t, reg)
+
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- rt.Start(ctx)
+	}()
+
+	select {
+	case <-stopEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for rollback to begin")
+	}
+
+	stopErr := rt.Stop(ctx)
+	if !errors.Is(stopErr, component.ErrInvalidStateTransition) {
+		t.Fatalf("expected stop to be rejected during rollback, got %v", stopErr)
+	}
+
+	close(allowStop)
+
+	err := <-startDone
+	if !errors.Is(err, startErr) {
+		t.Fatalf("expected start error %v, got %v", startErr, err)
+	}
+	if errors.Is(err, component.ErrInvalidStateTransition) {
+		t.Fatalf("start returned unexpected invalid state transition error: %v", err)
+	}
+
+	if events := collector.Events(); !slices.Equal(events, []string{"A:start", "B:start-err", "A:stop"}) {
+		t.Fatalf("unexpected events during rollback race test: %v", events)
+	}
+
+	stubB.startErr = nil
+	collector.Clear()
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("expected start retry to succeed after rollback, got %v", err)
+	}
+	if err := rt.Stop(ctx); err != nil {
+		t.Fatalf("stop after retry start failed: %v", err)
+	}
+}
+
 func TestStopFailuresAndContinuation(t *testing.T) {
 	errSentinel := errors.New("forced error")
 	aKey := component.NewKey[*stubComponent]("A")

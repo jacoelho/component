@@ -84,9 +84,9 @@ func NewLifecycleFSM() *LifecycleFSM {
 		{From: StateFailedStop, Event: EventStopRequested, To: StateStopping, Action: ActionRunStop},
 
 		{From: StateStarting, Event: EventStartSucceeded, To: StateStarted, Action: ActionNone},
-		{From: StateStarting, Event: EventStartFailed, To: StateFailedStart, Action: ActionNone},
-		{From: StateFailedStart, Event: EventStartRollbackSucceeded, To: StateStopped, Action: ActionNone},
-		{From: StateFailedStart, Event: EventStartRollbackFailed, To: StateFailedStart, Action: ActionNone},
+		{From: StateStarting, Event: EventStartFailed, To: StateRollingBackStart, Action: ActionNone},
+		{From: StateRollingBackStart, Event: EventStartRollbackSucceeded, To: StateStopped, Action: ActionNone},
+		{From: StateRollingBackStart, Event: EventStartRollbackFailed, To: StateFailedStart, Action: ActionNone},
 
 		{From: StateStopping, Event: EventStopSucceeded, To: StateStopped, Action: ActionNone},
 		{From: StateStopping, Event: EventStopFailed, To: StateFailedStop, Action: ActionNone},

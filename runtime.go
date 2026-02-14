@@ -83,7 +83,7 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	for level, ids := range rt.levelGroups {
 		if err := rt.startLevel(ctx, ids); err != nil {
 			transitionErr := rt.completeTransition(runtime.EventStartFailed)
-			rollbackErr := rt.stopThroughLevel(ctx, level)
+			rollbackErr := rt.stopLevels(ctx, level)
 			rollbackEvent := runtime.EventStartRollbackFailed
 			if rollbackErr == nil {
 				rollbackEvent = runtime.EventStartRollbackSucceeded
@@ -110,14 +110,7 @@ func (rt *Runtime) Stop(ctx context.Context) error {
 		return err
 	}
 
-	var errs []error
-	for level := len(rt.levelGroups) - 1; level >= 0; level-- {
-		if err := rt.stopLevel(ctx, rt.levelGroups[level]); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	aggErr := errors.Join(errs...)
+	aggErr := rt.stopLevels(ctx, len(rt.levelGroups)-1)
 
 	if aggErr != nil {
 		transitionErr := rt.completeTransition(runtime.EventStopFailed)
@@ -135,42 +128,46 @@ func (rt *Runtime) beginStartTransaction() error {
 		rt.entries = make(map[string]*runtimeEntry)
 	}
 
-	action, err := rt.transitionLocked(runtime.EventStartRequested)
-	if err != nil {
-		return err
-	}
-	if action != runtime.ActionRunStart {
-		return fmt.Errorf("unexpected lifecycle action for start request: %s", action)
-	}
-
-	return nil
+	return rt.transitionLockedExpectingAction(
+		runtime.EventStartRequested,
+		runtime.ActionRunStart,
+		"start request",
+	)
 }
 
 func (rt *Runtime) beginStopTransaction() error {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
-	action, err := rt.transitionLocked(runtime.EventStopRequested)
-	if err != nil {
-		return err
-	}
-	if action != runtime.ActionRunStop {
-		return fmt.Errorf("unexpected lifecycle action for stop request: %s", action)
-	}
-
-	return nil
+	return rt.transitionLockedExpectingAction(
+		runtime.EventStopRequested,
+		runtime.ActionRunStop,
+		"stop request",
+	)
 }
 
 func (rt *Runtime) completeTransition(event runtime.Event) error {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
+	return rt.transitionLockedExpectingAction(
+		event,
+		runtime.ActionNone,
+		fmt.Sprintf("completion event %s", event),
+	)
+}
+
+func (rt *Runtime) transitionLockedExpectingAction(
+	event runtime.Event,
+	expected runtime.Action,
+	context string,
+) error {
 	action, err := rt.transitionLocked(event)
 	if err != nil {
 		return err
 	}
-	if action != runtime.ActionNone {
-		return fmt.Errorf("unexpected lifecycle action for completion event %s: %s", event, action)
+	if action != expected {
+		return fmt.Errorf("unexpected lifecycle action for %s: %s", context, action)
 	}
 
 	return nil
@@ -273,7 +270,7 @@ func (rt *Runtime) startLevel(ctx context.Context, ids []string) error {
 	return ec.Err()
 }
 
-func (rt *Runtime) stopThroughLevel(ctx context.Context, highestLevel int) error {
+func (rt *Runtime) stopLevels(ctx context.Context, highestLevel int) error {
 	if highestLevel >= len(rt.levelGroups) {
 		highestLevel = len(rt.levelGroups) - 1
 	}

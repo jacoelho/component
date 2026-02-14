@@ -6,6 +6,7 @@ type State int
 const (
 	StateIdle State = iota
 	StateStarting
+	StateRollingBackStart
 	StateStarted
 	StateStopping
 	StateStopped
@@ -19,6 +20,8 @@ func (s State) String() string {
 		return "idle"
 	case StateStarting:
 		return "starting"
+	case StateRollingBackStart:
+		return "rollingBackStart"
 	case StateStarted:
 		return "started"
 	case StateStopping:
