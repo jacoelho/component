@@ -1,0 +1,400 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - revive
+    - errcheck
+    - ineffassign
+    - unused
+    - iface
+    - dupl
+    - dogsled
+    - forbidigo
+    - funlen
+    - gocritic
+    - goconst
+    - gocognit
+    - cyclop
+    - nestif
+    - maintidx
+    - unparam
+    - errorlint
+    - nilerr
+    - nilnil
+    - nilnesserr
+    - wastedassign
+    - forcetypeassert
+    - bodyclose
+    - nolintlint
+    - exhaustive
+    - gosec
+    - ireturn
+    - interfacebloat
+    - copyloopvar
+    - predeclared
+    - nakedret
+    - contextcheck
+    - reassign
+    - makezero
+    - modernize
+    - noctx
+    - recvcheck
+    - unconvert
+    - asciicheck
+    - bidichk
+    - depguard
+    - dupword
+    - durationcheck
+    - errchkjson
+    - errname
+    - gocheckcompilerdirectives
+    - gochecknoinits
+    - godoclint
+    - gomoddirectives
+    - goprintffuncname
+    - inamedparam
+    - intrange
+    - iotamixing
+    - mirror
+    - misspell
+    - musttag
+    - nosprintfhostport
+    - testableexamples
+    - thelper
+    - tparallel
+    - usestdlibvars
+    - usetesting
+
+  settings:
+    govet:
+      enable-all: true
+
+    errcheck:
+      check-blank: true
+      check-type-assertions: true
+
+    exhaustive:
+      default-signifies-exhaustive: true
+
+    nilnil:
+      detect-opposite: true
+
+    reassign:
+      patterns:
+        - ".*"
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-no-explanation: []
+
+    depguard:
+      rules:
+        main:
+          list-mode: strict
+          files:
+            - $all
+          allow:
+            - $gostd
+            - charm.land/bubbles/v2
+            - charm.land/bubbletea/v2
+            - charm.land/lipgloss/v2
+            - github.com/BurntSushi/toml
+            - github.com/charmbracelet/colorprofile
+            - github.com/charmbracelet/x/ansi
+            - github.com/charmbracelet/x/exp/golden
+            - github.com/charmbracelet/x/vt
+            - github.com/go-git/gcfg
+            - github.com/go-git/go-billy/v5
+            - github.com/go-git/go-git/v5
+            - github.com/jacoelho/bdd
+            - github.com/jacoelho/component$
+            - github.com/jacoelho/rvw
+            - github.com/rivo/uniseg
+            - golang.org/x/sys/unix
+
+        cmd-rvw-production:
+          list-mode: strict
+          files:
+            - "**/cmd/rvw/*.go"
+            - "!**/*_test.go"
+          allow:
+            - $gostd
+            - charm.land/bubbletea/v2
+            - github.com/jacoelho/rvw/internal/tui$
+            - github.com/jacoelho/rvw/internal/config$
+            - github.com/jacoelho/rvw/internal/delivery$
+            - github.com/jacoelho/rvw/internal/keymap$
+            - github.com/jacoelho/rvw/internal/output$
+            - github.com/jacoelho/rvw/internal/change$
+            - github.com/jacoelho/rvw/internal/commentseed$
+            - github.com/jacoelho/rvw/internal/source$
+            - golang.org/x/sys/unix$
+
+        tui-production:
+          list-mode: strict
+          files:
+            - "**/internal/tui/*.go"
+            - "!**/*_test.go"
+          allow:
+            - $gostd
+            - charm.land/bubbles/v2
+            - charm.land/bubbletea/v2
+            - charm.land/lipgloss/v2
+            - github.com/charmbracelet/x/ansi$
+            - github.com/jacoelho/rvw/internal/coordinator$
+            - github.com/jacoelho/rvw/internal/delivery$
+            - github.com/jacoelho/rvw/internal/keymap$
+            - github.com/jacoelho/rvw/internal/change$
+            - github.com/jacoelho/rvw/internal/projection$
+            - github.com/jacoelho/rvw/internal/source$
+            - github.com/jacoelho/rvw/internal/tui/render$
+            - github.com/rivo/uniseg$
+
+        tui-render-production:
+          list-mode: strict
+          files:
+            - "**/internal/tui/render/*.go"
+            - "!**/*_test.go"
+          allow:
+            - $gostd
+            - charm.land/lipgloss/v2
+
+        config-production:
+          list-mode: strict
+          files:
+            - "**/internal/config/*.go"
+            - "!**/*_test.go"
+          allow:
+            - $gostd
+            - github.com/BurntSushi/toml$
+            - github.com/charmbracelet/x/ansi$
+            - github.com/jacoelho/rvw/internal/keymap$
+
+        delivery-production:
+          list-mode: strict
+          files:
+            - "**/internal/delivery/*.go"
+            - "!**/*_test.go"
+          allow:
+            - $gostd
+
+        coordinator-production:
+          list-mode: strict
+          files:
+            - "**/internal/coordinator/*.go"
+            - "!**/*_test.go"
+          allow:
+            - $gostd
+            - github.com/jacoelho/rvw/internal/change$
+            - github.com/jacoelho/rvw/internal/source$
+
+        projection-production:
+          list-mode: strict
+          files:
+            - "**/internal/projection/*.go"
+            - "!**/*_test.go"
+          allow:
+            - $gostd
+            - github.com/jacoelho/rvw/internal/change$
+
+        output-production:
+          list-mode: strict
+          files:
+            - "**/internal/output/*.go"
+            - "!**/*_test.go"
+          allow:
+            - $gostd
+            - github.com/jacoelho/rvw/internal/change$
+            - github.com/jacoelho/rvw/internal/source$
+
+        change-production:
+          list-mode: strict
+          files:
+            - "**/internal/change/*.go"
+            - "!**/*_test.go"
+          allow:
+            - bytes$
+            - crypto/sha256$
+            - encoding/base64$
+            - encoding/json$
+            - errors$
+            - fmt$
+            - iter$
+            - maps$
+            - math$
+            - math/bits$
+            - slices$
+            - sort$
+            - strconv$
+            - strings$
+            - unicode$
+            - unicode/utf8$
+
+        source-production:
+          list-mode: strict
+          files:
+            - "**/internal/source/*.go"
+            - "!**/*_test.go"
+          allow:
+            - $gostd
+            - github.com/go-git/gcfg$
+            - github.com/go-git/go-billy/v5
+            - github.com/go-git/go-git/v5
+            - github.com/jacoelho/rvw/internal/change$
+            - golang.org/x/sys/unix$
+
+        commentseed-production:
+          list-mode: strict
+          files:
+            - "**/internal/commentseed/*.go"
+            - "!**/*_test.go"
+          allow:
+            - $gostd
+            - github.com/jacoelho/rvw/internal/change$
+            - github.com/jacoelho/rvw/internal/source$
+
+    revive:
+      enable-default-rules: true
+      rules:
+        - name: blank-imports
+        - name: bool-literal-in-expr
+        - name: constant-logical-expr
+        - name: context-as-argument
+          arguments:
+            - allow-types-before: "*testing.T"
+        - name: context-keys-type
+        - name: dot-imports
+        - name: empty-lines
+        - name: error-return
+        - name: error-strings
+        - name: exported
+          arguments:
+            - disableStutteringCheck
+        - name: identical-branches
+        - name: identical-ifelseif-branches
+        - name: identical-ifelseif-conditions
+        - name: identical-switch-branches
+        - name: identical-switch-conditions
+        - name: if-return
+        - name: increment-decrement
+        - name: modifies-value-receiver
+        - name: package-comments
+        - name: redefines-builtin-id
+        - name: superfluous-else
+          arguments:
+            - preserve-scope
+        - name: time-naming
+        - name: unchecked-type-assertion
+        - name: unexported-return
+        - name: unnecessary-if
+        - name: var-declaration
+        - name: var-naming
+
+    iface:
+      enable:
+        - identical
+        - unused
+        - opaque
+        - unexported
+
+    ireturn:
+      allow:
+        - anon
+        - error
+        - empty
+        - stdlib
+        - generic
+        - github\.com/jacoelho/rvw/internal/tui\.Outcome$
+        - charm\.land/bubbletea/v2\.Model$
+
+    dupl:
+      threshold: 120
+
+    dogsled:
+      max-blank-identifiers: 1
+
+    gocognit:
+      min-complexity: 50
+
+    cyclop:
+      max-complexity: 35
+
+    gocritic:
+      enabled-checks:
+        - boolExprSimplify
+        - commentedOutImport
+        - deferUnlambda
+        - dupImport
+        - emptyFallthrough
+        - emptyStringTest
+        - exposedSyncMutex
+        - hexLiteral
+        - httpNoBody
+        - methodExprCall
+        - octalLiteral
+        - preferFilepathJoin
+        - redundantSprint
+        - regexpSimplify
+        - stringConcatSimplify
+        - stringsCompare
+        - timeExprSimplify
+        - typeAssertChain
+        - typeUnparen
+        - unlabelStmt
+        - unnecessaryBlock
+        - whyNoLint
+        - yodaStyleExpr
+
+    funlen:
+      lines: 120
+      statements: 70
+      ignore-comments: true
+
+    nestif:
+      min-complexity: 15
+
+    maintidx:
+      under: 25
+
+  exclusions:
+    rules:
+      - path: ^example_test\.go$
+        linters:
+          - forbidigo
+      - path: ^example_test\.go$
+        source: ^func ExampleRuntime_gracefulHTTPShutdown\(\)
+        linters:
+          - testableexamples
+      - path: _test\.go
+        linters:
+          - cyclop
+          - gocognit
+          - goconst
+          - funlen
+          - nestif
+          - dupl
+          - maintidx
+          - dogsled
+          - errcheck
+          - gosec
+      - path: _test\.go
+        text: "unused-parameter:"
+        linters:
+          - revive
+      - path: _test\.go
+        linters:
+          - govet
+        text: "fieldalignment"
+      - path: _test\.go
+        linters:
+          - govet
+        text: "shadow:"

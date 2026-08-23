@@ -1,132 +1,130 @@
 package component
 
 import (
-	"errors"
 	"fmt"
-	"slices"
-	"strings"
+	"reflect"
 	"sync"
-
-	"github.com/jacoelho/component/internal/graph"
 )
 
-// Registry stores component declarations.
+// Registry collects lifecycle declarations. The zero Registry is usable.
+// Copies made after first use share the same registry identity. A successful
+// Compile consumes that identity.
 type Registry struct {
-	mu      sync.Mutex
-	entries map[string]*componentSpec
+	core *registryCore
 }
 
-// NewRegistry creates an empty component registry.
+type registryCore struct {
+	declarations map[*nodeIdentity]declaration
+	mu           sync.Mutex
+	consumed     bool
+}
+
+type declaration struct {
+	node         nodeDescriptor
+	lifecycle    Lifecycle
+	dependencies []nodeDescriptor
+}
+
+var registryInitializationMu sync.RWMutex
+
+// NewRegistry returns an empty Registry.
 func NewRegistry() *Registry {
-	return &Registry{
-		entries: make(map[string]*componentSpec),
-	}
+	return &Registry{core: &registryCore{}}
 }
 
-// Provide registers a component declaration.
-// Dependencies are validated for cycles immediately, while missing dependencies
-// are validated at Compile time.
-func Provide[T Lifecycle](
-	r *Registry,
-	key Key[T],
-	fn Constructor[T],
-	deps ...Keyer,
+// Register declares the lifecycle owned by node and its lifecycle-ordering
+// dependencies. Dependencies carry no values: they only require that each
+// dependency starts before node and stops after node.
+func (r *Registry) Register[T Lifecycle](
+	node *Node[T],
+	lifecycle T,
+	dependencies ...NodeRef,
 ) error {
 	if r == nil {
-		return fmt.Errorf("registry cannot be nil")
-	}
-	if fn == nil {
-		return fmt.Errorf("constructor function cannot be nil")
+		return fmt.Errorf("component: register on nil registry")
 	}
 
-	id := key.id()
-	if id == "" {
-		return fmt.Errorf("component key cannot be empty")
+	core := r.ensureCore()
+	core.mu.Lock()
+	defer core.mu.Unlock()
+
+	if core.consumed {
+		return ErrRegistryConsumed
+	}
+	identity := node.nodeIdentity()
+	if identity == nil {
+		return fmt.Errorf("%w: registration owner", ErrInvalidNode)
+	}
+	if isNilLifecycle(lifecycle) {
+		return fmt.Errorf("%w: node %q", ErrInvalidLifecycle, node.String())
+	}
+	if _, exists := core.declarations[identity]; exists {
+		return fmt.Errorf("%w: node %q", ErrAlreadyRegistered, node.String())
 	}
 
-	dependencies := make([]string, 0, len(deps))
-	for _, d := range deps {
-		if d == nil {
-			return fmt.Errorf("dependency cannot be nil")
+	dependencyDescriptors := make([]nodeDescriptor, 0, len(dependencies))
+	seen := make(map[*nodeIdentity]struct{}, len(dependencies))
+	for _, dependency := range dependencies {
+		dependencyIdentity := nodeRefIdentity(dependency)
+		if dependencyIdentity == nil {
+			return fmt.Errorf("%w: dependency of node %q", ErrInvalidNode, node.String())
 		}
-		depID := d.id()
-		if depID == "" {
-			return fmt.Errorf("dependency ID cannot be empty")
+		if _, exists := seen[dependencyIdentity]; exists {
+			return fmt.Errorf(
+				"%w: node %q depends on %q more than once",
+				ErrDuplicateDependency,
+				node.String(),
+				dependency.String(),
+			)
 		}
-		dependencies = append(dependencies, depID)
+		seen[dependencyIdentity] = struct{}{}
+		dependencyDescriptors = append(dependencyDescriptors, descriptor(dependency))
 	}
 
-	candidateEntry := &componentSpec{
-		constructor: func(rt *Runtime) (any, error) {
-			return fn(rt)
-		},
-		dependencies: dependencies,
+	if core.declarations == nil {
+		core.declarations = make(map[*nodeIdentity]declaration)
 	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if r.entries == nil {
-		r.entries = make(map[string]*componentSpec)
+	core.declarations[identity] = declaration{
+		node:         descriptor(node),
+		lifecycle:    lifecycle,
+		dependencies: dependencyDescriptors,
 	}
-
-	if _, exists := r.entries[id]; exists {
-		return wrapRegistrationError(id, ErrAlreadyRegistered)
-	}
-
-	candidate := cloneSpecs(r.entries)
-	candidate[id] = &componentSpec{
-		constructor:  candidateEntry.constructor,
-		dependencies: slices.Clone(candidateEntry.dependencies),
-	}
-
-	if _, err := graph.ComputeLevels(dependencyMap(candidate), graph.IgnoreMissingDependencies); err != nil {
-		return mapGraphError(err)
-	}
-
-	r.entries[id] = candidateEntry
 	return nil
 }
 
-// Compile validates and freezes the registered dependency graph.
-func (r *Registry) Compile() (*Plan, error) {
-	if r == nil {
-		return nil, fmt.Errorf("registry cannot be nil")
+func nodeRefIdentity(node NodeRef) *nodeIdentity {
+	if node == nil {
+		return nil
 	}
-
-	r.mu.Lock()
-	specs := cloneSpecs(r.entries)
-	r.mu.Unlock()
-
-	levels, err := graph.ComputeLevels(dependencyMap(specs), graph.StrictValidation)
-	if err != nil {
-		return nil, mapGraphError(err)
-	}
-
-	levelGroups := graph.GroupByLevel(levels)
-
-	return &Plan{
-		specs:       specs,
-		levelGroups: levelGroups,
-	}, nil
+	return node.nodeIdentity()
 }
 
-func mapGraphError(err error) error {
-	var cycleErr *graph.CycleError
-	if errors.As(err, &cycleErr) {
-		if len(cycleErr.Path) > 0 {
-			return fmt.Errorf("dependency cycle: %s: %w", strings.Join(cycleErr.Path, " -> "), ErrCyclicDependency)
-		}
-		return fmt.Errorf("dependency cycle: %w", ErrCyclicDependency)
+func (r *Registry) ensureCore() *registryCore {
+	registryInitializationMu.RLock()
+	core := r.core
+	registryInitializationMu.RUnlock()
+	if core != nil {
+		return core
 	}
 
-	var depErr *graph.UnknownDependencyError
-	if errors.As(err, &depErr) {
-		if depErr.ComponentID != "" {
-			return fmt.Errorf("component %q depends on unknown %q: %w", depErr.ComponentID, depErr.DependencyID, ErrNotRegistered)
-		}
-		return fmt.Errorf("missing dependency %q: %w", depErr.DependencyID, ErrNotRegistered)
+	registryInitializationMu.Lock()
+	defer registryInitializationMu.Unlock()
+	if r.core == nil {
+		r.core = &registryCore{}
 	}
+	return r.core
+}
 
-	return err
+func isNilLifecycle(lifecycle Lifecycle) bool {
+	if lifecycle == nil {
+		return true
+	}
+	value := reflect.ValueOf(lifecycle)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }

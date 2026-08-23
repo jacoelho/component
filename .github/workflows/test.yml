@@ -1,4 +1,9 @@
-on: [push, pull_request]
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
 name: test and build
 jobs:
   test:
@@ -13,5 +18,7 @@ jobs:
       - run: make ci-tidy
 
       - run: make staticcheck
+
+      - run: make vet
 
       - run: make test
