@@ -1,8 +1,7 @@
 # disable default rules
 .SUFFIXES:
 MAKEFLAGS+=-r -R
-GOBIN = $(shell go env GOPATH)/bin
-DATE  = $(shell date +%Y%m%d%H%M%S)
+STATICCHECK_VERSION = v0.8.0-rc.1
 
 default: test
 
@@ -14,15 +13,14 @@ test:
 fmt:
 	go fmt ./...
 
+.PHONY: vet
+vet:
+	go vet ./...
+
 .PHONY: ci-tidy
 ci-tidy:
-	go mod tidy
-	git status --porcelain go.mod go.sum || { echo "Please run 'go mod tidy'."; exit 1; }
-
-$(GOBIN)/staticcheck:
-	go install honnef.co/go/tools/cmd/staticcheck@latest
+	go mod tidy -diff
 
 .PHONY: staticcheck
-staticcheck: $(GOBIN)/staticcheck
-	$(GOBIN)/staticcheck ./...
-
+staticcheck:
+	go run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) ./...

@@ -2,54 +2,121 @@ package component
 
 import (
 	"context"
-	"fmt"
-	"reflect"
+	"sync/atomic"
 )
 
-// Lifecycle defines the temporal boundaries of a component's operation.
-// Implementations should ensure Stop is idempotent and cleans up after Start.
-type Lifecycle interface {
-	// Start initializes long-lived resources.
-	// It is called after dependencies have started and should return when
-	// initialization is complete.
-	Start(context.Context) error
-
-	// Stop releases resources and terminates operations.
-	// It is called in reverse dependency order and should return when cleanup
-	// is complete.
-	Stop(context.Context) error
+// Node identifies one lifecycle owner of type T in a Registry.
+//
+// A Node carries no value and provides no lookup capability. Its identity is
+// opaque; the label supplied to NewNode is used only for diagnostics. Node
+// values must not be copied; copy the pointer returned by NewNode instead.
+type Node[T Lifecycle] struct {
+	noCopy   noCopy[T]
+	identity *nodeIdentity
 }
 
-// Constructor creates a component instance for a runtime.
-// Use Get inside constructors to retrieve already-started dependencies.
-type Constructor[T Lifecycle] func(*Runtime) (T, error)
-
-// Key identifies a component producing type T in the registry.
-type Key[T Lifecycle] struct {
-	name string
+// NodeRef is a type-erased Node pointer used to express lifecycle-ordering
+// dependencies between owners of different types. It cannot be implemented
+// outside this package.
+type NodeRef interface {
+	String() string
+	nodeIdentity() *nodeIdentity
 }
 
-// NewKey returns a Key[T] with the given name.
-// Used for disambiguating multiple instances of the same type T.
-// If types are different, names can be the same or empty without collision.
-func NewKey[T Lifecycle](name string) Key[T] {
-	return Key[T]{name: name}
+// noCopy marks values as non-copyable for go vet and keeps instantiations for
+// different lifecycle types structurally distinct.
+type noCopy[T any] struct{}
+
+func (*noCopy[T]) Lock()   {}
+func (*noCopy[T]) Unlock() {}
+
+type nodeIdentity struct {
+	label   string
+	ordinal uint64
 }
 
-// id returns the unique string identifier for this key.
-func (k Key[T]) id() string {
-	typ := reflect.TypeFor[T]().String()
-	if k.name != "" {
-		return fmt.Sprintf("%s(%s)", typ, k.name)
+type nodeDescriptor struct {
+	identity *nodeIdentity
+	label    string
+	ordinal  uint64
+}
+
+func descriptor(node NodeRef) nodeDescriptor {
+	identity := node.nodeIdentity()
+	return nodeDescriptor{
+		identity: identity,
+		label:    identity.label,
+		ordinal:  identity.ordinal,
 	}
-	return typ
 }
 
-func (k Key[T]) String() string {
-	return k.id()
+var nextNodeOrdinal atomic.Uint64
+
+// NewNode creates a distinct lifecycle identity. Reusing a label does not
+// reuse an identity.
+func NewNode[T Lifecycle](label string) *Node[T] {
+	return &Node[T]{identity: &nodeIdentity{
+		label:   label,
+		ordinal: nextNodeOrdinal.Add(1),
+	}}
 }
 
-// Keyer provides type erasure for heterogeneous component keys.
-type Keyer interface {
-	id() string
+// String returns the node's diagnostic label. A nil or zero Node is reported
+// as "<invalid>".
+func (n *Node[T]) String() string {
+	if n == nil || n.identity == nil {
+		return "<invalid>"
+	}
+	return n.identity.label
+}
+
+func (n *Node[T]) nodeIdentity() *nodeIdentity {
+	if n == nil {
+		return nil
+	}
+	return n.identity
+}
+
+// Lifecycle controls one resource owner.
+//
+// Configure establishes reversible, non-live state. Start makes the owner
+// live and returns once it is ready. Stop releases configured or started
+// state and must tolerate partial setup and retries after a failed Stop.
+// Application-owned types should implement Lifecycle directly.
+type Lifecycle interface {
+	Configure(ctx context.Context) error
+	Start(ctx context.Context) error
+	Stop(ctx context.Context) error
+}
+
+// LifecycleFuncs adapts lifecycle functions or external owners with
+// incompatible method signatures to Lifecycle. Nil callbacks are no-ops.
+type LifecycleFuncs struct {
+	OnConfigure func(context.Context) error
+	OnStart     func(context.Context) error
+	OnStop      func(context.Context) error
+}
+
+// Configure invokes OnConfigure when set; otherwise it returns nil.
+func (f LifecycleFuncs) Configure(ctx context.Context) error {
+	if f.OnConfigure == nil {
+		return nil
+	}
+	return f.OnConfigure(ctx)
+}
+
+// Start invokes OnStart when set; otherwise it returns nil.
+func (f LifecycleFuncs) Start(ctx context.Context) error {
+	if f.OnStart == nil {
+		return nil
+	}
+	return f.OnStart(ctx)
+}
+
+// Stop invokes OnStop when set; otherwise it returns nil.
+func (f LifecycleFuncs) Stop(ctx context.Context) error {
+	if f.OnStop == nil {
+		return nil
+	}
+	return f.OnStop(ctx)
 }
