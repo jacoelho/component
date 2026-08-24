@@ -2,6 +2,7 @@ package component
 
 import (
 	"context"
+	"reflect"
 	"sync/atomic"
 )
 
@@ -15,9 +16,9 @@ type Node[T Lifecycle] struct {
 	identity *nodeIdentity
 }
 
-// NodeRef is a type-erased Node pointer used to express lifecycle-ordering
-// dependencies between owners of different types. It cannot be implemented
-// outside this package.
+// NodeRef is a type-erased lifecycle identity used to express ordering,
+// including identities returned by Registry.Provide. It carries no value and
+// cannot be implemented outside this package.
 type NodeRef interface {
 	String() string
 	nodeIdentity() *nodeIdentity
@@ -31,22 +32,25 @@ func (*noCopy[T]) Lock()   {}
 func (*noCopy[T]) Unlock() {}
 
 type nodeIdentity struct {
-	label   string
-	ordinal uint64
+	label        string
+	ordinal      uint64
+	declaredType reflect.Type
 }
 
 type nodeDescriptor struct {
-	identity *nodeIdentity
-	label    string
-	ordinal  uint64
+	identity     *nodeIdentity
+	label        string
+	ordinal      uint64
+	declaredType reflect.Type
 }
 
 func descriptor(node NodeRef) nodeDescriptor {
 	identity := node.nodeIdentity()
 	return nodeDescriptor{
-		identity: identity,
-		label:    identity.label,
-		ordinal:  identity.ordinal,
+		identity:     identity,
+		label:        identity.label,
+		ordinal:      identity.ordinal,
+		declaredType: identity.declaredType,
 	}
 }
 
@@ -55,10 +59,15 @@ var nextNodeOrdinal atomic.Uint64
 // NewNode creates a distinct lifecycle identity. Reusing a label does not
 // reuse an identity.
 func NewNode[T Lifecycle](label string) *Node[T] {
-	return &Node[T]{identity: &nodeIdentity{
-		label:   label,
-		ordinal: nextNodeOrdinal.Add(1),
-	}}
+	return &Node[T]{identity: newNodeIdentity(label, reflect.TypeFor[T]())}
+}
+
+func newNodeIdentity(label string, declaredType reflect.Type) *nodeIdentity {
+	return &nodeIdentity{
+		label:        label,
+		ordinal:      nextNodeOrdinal.Add(1),
+		declaredType: declaredType,
+	}
 }
 
 // String returns the node's diagnostic label. A nil or zero Node is reported

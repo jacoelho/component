@@ -15,8 +15,19 @@ var (
 	ErrNotRegistered = errors.New("component: node not registered")
 	// ErrCyclicDependency reports a dependency cycle.
 	ErrCyclicDependency = errors.New("component: cyclic dependency")
-	// ErrRegistryConsumed reports use after a successful Compile.
+	// ErrRegistryConsumed reports use after Compile accepted the graph and
+	// began construction.
 	ErrRegistryConsumed = errors.New("component: registry consumed")
+	// ErrInvalidConstructor reports an unsupported provider constructor.
+	ErrInvalidConstructor = errors.New("component: invalid constructor")
+	// ErrInvalidBinding reports an invalid or repeated explicit type binding.
+	ErrInvalidBinding = errors.New("component: invalid binding")
+	// ErrAmbiguousDependency reports multiple owners matching one constructor
+	// parameter.
+	ErrAmbiguousDependency = errors.New("component: ambiguous dependency")
+	// ErrConstruction reports a provider constructor error, panic, abort, or
+	// invalid lifecycle result.
+	ErrConstruction = errors.New("component: construction failed")
 	// ErrAlreadyStarted reports a Start call on a one-shot Runtime that has
 	// already had a Start attempt or has been stopped.
 	ErrAlreadyStarted = errors.New("component: runtime already started")
