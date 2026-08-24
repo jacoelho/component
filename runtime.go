@@ -36,10 +36,8 @@ type runtimeCore struct {
 }
 
 type runtimeEntry struct {
-	node         nodeDescriptor
-	lifecycle    Lifecycle
-	dependencies []int
-	dependents   []int
+	graphEntry
+	lifecycle Lifecycle
 }
 
 type lifecyclePhase string

@@ -224,29 +224,29 @@ func TestMissingDependencyDiagnosticIgnoresArgumentOrder(t *testing.T) {
 	}
 }
 
-func BenchmarkCompileDeclarations(b *testing.B) {
+func BenchmarkCompileGraph(b *testing.B) {
 	const nodeCount = 1_000
 	benchmarks := []struct {
-		name         string
-		declarations []declaration
+		name        string
+		definitions []graphDefinition
 	}{
-		{name: "deep-chain", declarations: benchmarkChainDeclarations(nodeCount)},
-		{name: "wide", declarations: benchmarkWideDeclarations(nodeCount)},
+		{name: "deep-chain", definitions: benchmarkChainDefinitions(nodeCount)},
+		{name: "wide", definitions: benchmarkWideDefinitions(nodeCount)},
 	}
 
 	for _, benchmark := range benchmarks {
 		b.Run(benchmark.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				entries, frontiers, err := compileDeclarations(benchmark.declarations)
+				graph, err := compileGraph(benchmark.definitions)
 				if err != nil {
-					b.Fatalf("compileDeclarations() failed: %v", err)
+					b.Fatalf("compileGraph() failed: %v", err)
 				}
-				if len(entries) != nodeCount || len(frontiers) == 0 {
+				if len(graph.entries) != nodeCount || len(graph.frontiers) == 0 {
 					b.Fatalf(
-						"compileDeclarations() returned %d entries and %d frontiers",
-						len(entries),
-						len(frontiers),
+						"compileGraph() returned %d entries and %d frontiers",
+						len(graph.entries),
+						len(graph.frontiers),
 					)
 				}
 			}
@@ -254,25 +254,25 @@ func BenchmarkCompileDeclarations(b *testing.B) {
 	}
 }
 
-func benchmarkChainDeclarations(count int) []declaration {
+func benchmarkChainDefinitions(count int) []graphDefinition {
 	nodes := benchmarkNodeDescriptors(count)
-	declarations := make([]declaration, count)
+	definitions := make([]graphDefinition, count)
 	for index, node := range nodes {
-		declarations[index] = declaration{node: node, lifecycle: noOpLifecycle()}
+		definitions[index] = graphDefinition{node: node}
 		if index != 0 {
-			declarations[index].dependencies = []nodeDescriptor{nodes[index-1]}
+			definitions[index].dependencies = []nodeDescriptor{nodes[index-1]}
 		}
 	}
-	return declarations
+	return definitions
 }
 
-func benchmarkWideDeclarations(count int) []declaration {
+func benchmarkWideDefinitions(count int) []graphDefinition {
 	nodes := benchmarkNodeDescriptors(count)
-	declarations := make([]declaration, count)
+	definitions := make([]graphDefinition, count)
 	for index, node := range nodes {
-		declarations[index] = declaration{node: node, lifecycle: noOpLifecycle()}
+		definitions[index] = graphDefinition{node: node}
 	}
-	return declarations
+	return definitions
 }
 
 func benchmarkNodeDescriptors(count int) []nodeDescriptor {

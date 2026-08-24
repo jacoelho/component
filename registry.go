@@ -7,14 +7,16 @@ import (
 )
 
 // Registry collects lifecycle declarations. The zero Registry is usable.
-// Copies made after first use share the same registry identity. A successful
-// Compile consumes that identity.
+// Copies made after first use share the same registry identity. Compile
+// consumes that identity after structural validation succeeds.
 type Registry struct {
 	core *registryCore
 }
 
 type registryCore struct {
 	declarations map[*nodeIdentity]declaration
+	providers    map[*nodeIdentity]providerEntry
+	bindings     map[reflect.Type]*nodeIdentity
 	mu           sync.Mutex
 	consumed     bool
 }
@@ -22,6 +24,7 @@ type registryCore struct {
 type declaration struct {
 	node         nodeDescriptor
 	lifecycle    Lifecycle
+	value        reflect.Value
 	dependencies []nodeDescriptor
 }
 
@@ -32,9 +35,10 @@ func NewRegistry() *Registry {
 	return &Registry{core: &registryCore{}}
 }
 
-// Register declares the lifecycle owned by node and its lifecycle-ordering
-// dependencies. Dependencies carry no values: they only require that each
-// dependency starts before node and stops after node.
+// Register declares an already constructed lifecycle owned by node and its
+// lifecycle-ordering dependencies. Dependencies carry no values: they only
+// require that each dependency starts before node and stops after node. The
+// declared T may satisfy parameters of constructors registered with Provide.
 func (r *Registry) Register[T Lifecycle](
 	node *Node[T],
 	lifecycle T,
@@ -87,9 +91,16 @@ func (r *Registry) Register[T Lifecycle](
 	core.declarations[identity] = declaration{
 		node:         descriptor(node),
 		lifecycle:    lifecycle,
+		value:        declaredValue(identity.declaredType, lifecycle),
 		dependencies: dependencyDescriptors,
 	}
 	return nil
+}
+
+func declaredValue(declaredType reflect.Type, value any) reflect.Value {
+	boxed := reflect.New(declaredType).Elem()
+	boxed.Set(reflect.ValueOf(value))
+	return boxed
 }
 
 func nodeRefIdentity(node NodeRef) *nodeIdentity {

@@ -61,7 +61,7 @@ func (*exampleService) Stop(context.Context) error {
 	return nil
 }
 
-func Example_structComposition() {
+func ExampleRegistry_Register() {
 	logger := &exampleLogger{}
 	service, err := newExampleService(logger)
 	if err != nil {
@@ -75,6 +75,37 @@ func Example_structComposition() {
 		panic(err)
 	}
 	if err := registry.Register(serviceNode, service, loggerNode); err != nil {
+		panic(err)
+	}
+
+	runtime, err := registry.Compile()
+	if err != nil {
+		panic(err)
+	}
+	if err := runtime.Start(context.Background()); err != nil {
+		panic(err)
+	}
+	if err := runtime.Stop(context.Background()); err != nil {
+		panic(err)
+	}
+
+	// Output:
+	// configure logger
+	// configure service
+	// start logger
+	// start service
+	// stop service
+	// stop logger
+}
+
+func ExampleRegistry_Provide() {
+	registry := component.NewRegistry()
+	if _, err := registry.Provide("logger", func() *exampleLogger {
+		return &exampleLogger{}
+	}); err != nil {
+		panic(err)
+	}
+	if _, err := registry.Provide("service", newExampleService); err != nil {
 		panic(err)
 	}
 
