@@ -1,9 +1,9 @@
 package component
 
 import (
-	"container/heap"
 	"context"
 	"errors"
+	"runtime/debug"
 	"sync"
 )
 
@@ -23,19 +23,19 @@ const (
 type Runtime struct{ core *runtimeCore }
 
 type runtimeCore struct {
-	mu          sync.Mutex
-	state       runtimeState
-	entries     []graphEntry
-	indices     map[*definition]int
-	parallelism int
+	mu      sync.Mutex
+	state   runtimeState
+	entries []graphEntry
+	indices map[*definition]int
+	order   []int
 	// Only the active operation writes cells. Value reads them under mu solely
 	// while running, when no operation may mutate them.
 	values []any
 }
 
-// Start constructs nodes after their dependencies are ready, then calls Start
+// Start constructs nodes serially after their dependencies are ready, then calls Start
 // on managed results. It never rolls back. Call Stop even after failed startup.
-// Cancellation stops new dispatch and waits for all dispatched callbacks.
+// Cancellation prevents the next node from starting and waits for the current callback.
 func (rt *Runtime) Start(ctx context.Context) error {
 	if rt == nil || rt.core == nil {
 		return ErrInvalidRuntime
@@ -71,49 +71,23 @@ func (rt *Runtime) Start(ctx context.Context) error {
 }
 
 func (rt *runtimeCore) start(ctx context.Context) error {
-	remaining := make([]int, len(rt.entries))
-	ready := &readyQueue{}
-	for index, entry := range rt.entries {
-		remaining[index] = len(entry.dependencies)
-		if remaining[index] == 0 {
-			heap.Push(ready, index)
+	for _, index := range rt.order {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-	}
-	results := make(chan invocationResult, rt.parallelism)
-	failures := make([]error, len(rt.entries))
-	inFlight := 0
-	failed := false
-	for {
-		for !failed && ready.Len() != 0 && inFlight < rt.parallelism && ctx.Err() == nil {
-			index := heap.Pop(ready).(int)
-			entry := rt.entries[index]
-			arguments := make([]any, len(entry.arguments))
-			for position, dependency := range entry.arguments {
-				arguments[position] = rt.values[dependency]
-			}
-			inFlight++
-			go invokeNode(ctx, index, entry.definition, arguments, nil, results)
+		entry := rt.entries[index]
+		arguments := make([]any, len(entry.arguments))
+		for position, dependency := range entry.arguments {
+			arguments[position] = rt.values[dependency]
 		}
-		if inFlight == 0 {
-			break
-		}
-		result := <-results
-		inFlight--
+		result := invokeNode(ctx, index, entry.definition, arguments, nil)
 		// A transferred cell survives even if its Start hook failed or aborted.
-		rt.values[result.index] = result.value
+		rt.values[index] = result.value
 		if result.err != nil {
-			failures[result.index] = result.err
-			failed = true
-			continue
-		}
-		for _, dependent := range rt.entries[result.index].dependents {
-			remaining[dependent]--
-			if remaining[dependent] == 0 {
-				heap.Push(ready, dependent)
-			}
+			return errors.Join(result.err, ctx.Err())
 		}
 	}
-	return operationErrors(failures, ctx.Err(), false)
+	return ctx.Err()
 }
 
 // Stop releases constructed nodes after all their constructed dependents finish.
@@ -153,72 +127,36 @@ func (rt *Runtime) Stop(ctx context.Context) error {
 }
 
 func (rt *runtimeCore) stop(ctx context.Context) error {
-	remaining := make([]int, len(rt.entries))
-	ready := &readyQueue{}
-	for index, entry := range rt.entries {
+	failures := make([]error, len(rt.entries))
+next:
+	for position := len(rt.order) - 1; position >= 0; position-- {
+		index := rt.order[position]
 		if rt.values[index] == nil {
 			continue
 		}
+		entry := rt.entries[index]
 		for _, dependent := range entry.dependents {
 			if rt.values[dependent] != nil {
-				remaining[index]++
+				continue next
 			}
 		}
-		if remaining[index] == 0 {
-			heap.Push(ready, index)
-		}
-	}
-	results := make(chan invocationResult, rt.parallelism)
-	failures := make([]error, len(rt.entries))
-	inFlight := 0
-	complete := func(index int) {
-		rt.values[index] = nil
-		for _, dependency := range rt.entries[index].dependencies {
-			remaining[dependency]--
-			if remaining[dependency] == 0 {
-				heap.Push(ready, dependency)
-			}
-		}
-	}
-	for {
-		for ready.Len() != 0 {
-			index := (*ready)[0]
-			node := rt.entries[index].definition
-			if node.stop == nil {
-				heap.Pop(ready)
-				complete(index)
-				continue
-			}
+		if entry.definition.stop != nil {
 			if ctx.Err() != nil {
-				// The retained cell makes this node eligible again on the next
-				// Stop. Continue draining pure nodes without invoking callbacks.
-				heap.Pop(ready)
 				continue
 			}
-			if inFlight == rt.parallelism {
-				break
+			result := invokeNode(ctx, index, entry.definition, nil, rt.values[index])
+			if result.err != nil {
+				failures[index] = result.err
+				continue
 			}
-			heap.Pop(ready)
-			inFlight++
-			go invokeNode(ctx, index, node, nil, rt.values[index], results)
 		}
-		if inFlight == 0 {
-			break
-		}
-		result := <-results
-		inFlight--
-		if result.err != nil {
-			failures[result.index] = result.err
-			continue
-		}
-		complete(result.index)
+		// Pure nodes can complete even after cancellation without invoking user code.
+		rt.values[index] = nil
 	}
-	pending := rt.hasValues()
-	var contextErr error
-	if pending {
-		contextErr = ctx.Err()
+	if rt.hasValues() {
+		failures = append(failures, ErrCleanupPending, ctx.Err())
 	}
-	return operationErrors(failures, contextErr, pending)
+	return errors.Join(failures...)
 }
 
 // Value returns a borrowed instance only while the runtime is successfully
@@ -250,32 +188,48 @@ func (rt *runtimeCore) hasValues() bool {
 	return false
 }
 
-func operationErrors(failures []error, contextErr error, pending bool) error {
-	var errs []error
-	for _, failure := range failures {
-		if failure != nil {
-			errs = append(errs, failure)
-		}
-	}
-	if pending {
-		errs = append(errs, ErrCleanupPending)
-	}
-	if contextErr != nil {
-		errs = append(errs, contextErr)
-	}
-	// Joining does not format, unwrap, or classify user errors.
-	return errors.Join(errs...)
+type invocationResult struct {
+	value any
+	err   error
 }
 
-type readyQueue []int
-
-func (q readyQueue) Len() int           { return len(q) }
-func (q readyQueue) Less(i, j int) bool { return q[i] < q[j] }
-func (q readyQueue) Swap(i, j int)      { q[i], q[j] = q[j], q[i] }
-func (q *readyQueue) Push(value any)    { *q = append(*q, value.(int)) }
-func (q *readyQueue) Pop() any {
-	last := len(*q) - 1
-	value := (*q)[last]
-	*q = (*q)[:last]
-	return value
+// Isolation prevents Goexit from terminating the runtime's caller. Deferred
+// publication preserves transferred ownership through a Start panic or Goexit.
+func invokeNode(ctx context.Context, index int, node *definition, arguments []any, value any) invocationResult {
+	results := make(chan invocationResult)
+	go func() {
+		result := invocationResult{value: value}
+		phase := "construct"
+		returned := false
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				cause, _ := recovered.(error)
+				failure := nodeFailure(index, node, phase, cause)
+				failure.kind = ErrPanic
+				failure.panicValue = recovered
+				failure.Stack = debug.Stack()
+				result.err = failure
+			} else if !returned {
+				failure := nodeFailure(index, node, phase, nil)
+				failure.kind = ErrAborted
+				result.err = failure
+			}
+			results <- result
+		}()
+		if value != nil {
+			phase = "stop"
+			result.err = node.stop(ctx, value)
+		} else {
+			result.value, result.err = node.create(ctx, arguments)
+			if result.err == nil && node.start != nil {
+				phase = "start"
+				result.err = node.start(ctx, result.value)
+			}
+		}
+		if result.err != nil {
+			result.err = nodeFailure(index, node, phase, result.err)
+		}
+		returned = true
+	}()
+	return <-results
 }

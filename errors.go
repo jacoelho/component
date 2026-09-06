@@ -14,8 +14,6 @@ var (
 	ErrInvalidValue = errors.New("component: invalid managed value")
 	// ErrInvalidRuntime reports a nil or zero runtime.
 	ErrInvalidRuntime = errors.New("component: invalid runtime")
-	// ErrInvalidOptions reports invalid runtime limits.
-	ErrInvalidOptions = errors.New("component: invalid options")
 	// ErrInvalidContext reports a nil operation context.
 	ErrInvalidContext = errors.New("component: invalid context")
 	// ErrBusy reports an overlapping startup or shutdown operation.

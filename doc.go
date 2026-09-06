@@ -10,8 +10,10 @@
 // resolver.
 //
 // Runtime.Start and Runtime.Stop receive independent caller-created contexts.
-// Start does not roll back acquired resources. Applications call Stop after a
-// failed Start, and Stop methods must be safe to retry after partial failure.
+// Runtime runs one node at a time in deterministic dependency order. Start does
+// not roll back acquired resources. Applications call Stop after a failed
+// Start, and Stop methods must be safe to retry after partial failure. A failed
+// stop retains that node's dependencies until a later Stop succeeds.
 // See README.md for the quickstart and ARCHITECTURE.md for the ownership,
 // lifecycle, error, and execution contracts.
 package component

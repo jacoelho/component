@@ -41,9 +41,9 @@ func (r *constructionResource) Stop(ctx context.Context) error {
 	return r.stopFn(ctx)
 }
 
-func newTestRuntime(t *testing.T, options component.RuntimeOptions, roots ...component.Root) *component.Runtime {
+func newTestRuntime(t *testing.T, roots ...component.Root) *component.Runtime {
 	t.Helper()
-	rt, err := component.New(options, roots...)
+	rt, err := component.New(roots...)
 	if err != nil {
 		t.Fatalf("New returned an error: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestDefinitionsDoNotRunFactoriesUntilStart(t *testing.T) {
 		return 42
 	})
 
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	if got := calls.Load(); got != 0 {
 		t.Fatalf("factory calls after New = %d, want 0", got)
 	}
@@ -87,24 +87,10 @@ func TestNewValidatesAllRootsBeforeRunningAnyFactory(t *testing.T) {
 	})
 	var invalid component.Ref[string]
 
-	_, err := component.New(component.RuntimeOptions{}, valid, invalid)
+	_, err := component.New(valid, invalid)
 	requireSentinel(t, err, component.ErrInvalidReference)
 	if got := calls.Load(); got != 0 {
 		t.Fatalf("factory calls after invalid New = %d, want 0", got)
-	}
-}
-
-func TestNewRejectsInvalidOptionsBeforeRunningFactories(t *testing.T) {
-	var calls atomic.Int32
-	ref := component.Provide(func() int {
-		calls.Add(1)
-		return 11
-	})
-
-	_, err := component.New(component.RuntimeOptions{Parallelism: -1}, ref)
-	requireSentinel(t, err, component.ErrInvalidOptions)
-	if got := calls.Load(); got != 0 {
-		t.Fatalf("factory calls after invalid options = %d, want 0", got)
 	}
 }
 
@@ -115,7 +101,7 @@ func TestValueIsBorrowedAndFunctionValuesAreNotInvoked(t *testing.T) {
 		return 99
 	}
 	ref := component.Value(value)
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start returned an error")
 	}
@@ -146,7 +132,7 @@ func TestSharedRefsAndRepeatedRootsMaterializeOnce(t *testing.T) {
 	left := base.Map(func(r *constructionResource) int { return r.id + 1 })
 	right := base.Map(func(r *constructionResource) int { return r.id + 2 })
 
-	rt := newTestRuntime(t, component.RuntimeOptions{}, left, right, left)
+	rt := newTestRuntime(t, left, right, left)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start returned an error")
 	}
@@ -172,7 +158,7 @@ func TestUnusedDefinitionsAreNotReachable(t *testing.T) {
 		return 2
 	})
 
-	rt := newTestRuntime(t, component.RuntimeOptions{}, usedRef)
+	rt := newTestRuntime(t, usedRef)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start returned an error")
 	}
@@ -194,7 +180,7 @@ func TestPureMapPreservesTheOwnedDependencyLifetime(t *testing.T) {
 	}, component.Managed[*constructionResource]())
 	view := owner.Map(func(r *constructionResource) constructionInterface { return r })
 
-	rt := newTestRuntime(t, component.RuntimeOptions{}, view)
+	rt := newTestRuntime(t, view)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start returned an error")
 	}
@@ -219,8 +205,8 @@ func TestIndependentRuntimesConstructIndependentOwnedValues(t *testing.T) {
 			return nil
 		}}
 	}, component.Managed[*constructionResource]())
-	one := newTestRuntime(t, component.RuntimeOptions{}, ref)
-	two := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	one := newTestRuntime(t, ref)
+	two := newTestRuntime(t, ref)
 	if err := one.Start(context.Background()); err != nil {
 		t.Fatalf("first Start returned an error")
 	}
@@ -256,7 +242,7 @@ func TestInputsPreserveArgumentOrderAndRepeatedArguments(t *testing.T) {
 		calls.Add(1)
 		return first*100 + second
 	})
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start returned an error")
 	}
@@ -281,7 +267,7 @@ func TestTypedInterfaceValuesAndNilInterfacesRemainValid(t *testing.T) {
 	var nilInterface constructionInterface
 	nilRef := component.Value(nilInterface)
 
-	rt := newTestRuntime(t, component.RuntimeOptions{}, view, nilRef)
+	rt := newTestRuntime(t, view, nilRef)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start returned an error")
 	}
@@ -304,7 +290,7 @@ func TestTypedInterfaceValuesAndNilInterfacesRemainValid(t *testing.T) {
 func TestTypedNilUnmanagedValuesAreOrdinaryValues(t *testing.T) {
 	var value *constructionResource
 	ref := component.Value(value)
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start returned an error")
 	}
@@ -325,7 +311,7 @@ func TestOwnershipValidationHappensAtNew(t *testing.T) {
 	withoutOwnership := component.Provide(func() *constructionResource {
 		return &constructionResource{}
 	}, zero)
-	_, err := component.New(component.RuntimeOptions{}, withoutOwnership)
+	_, err := component.New(withoutOwnership)
 	requireSentinel(t, err, component.ErrInvalidDefinition)
 
 	withTwo := component.Provide(func() *constructionResource {
@@ -334,14 +320,14 @@ func TestOwnershipValidationHappensAtNew(t *testing.T) {
 		component.Managed[*constructionResource](),
 		component.Managed[*constructionResource](),
 	)
-	_, err = component.New(component.RuntimeOptions{}, withTwo)
+	_, err = component.New(withTwo)
 	requireSentinel(t, err, component.ErrInvalidDefinition)
 }
 
 func TestNilConstructorsAreRejectedBeforeStart(t *testing.T) {
 	var create func() int
 	ref := component.Provide(create)
-	_, err := component.New(component.RuntimeOptions{}, ref)
+	_, err := component.New(ref)
 	requireSentinel(t, err, component.ErrInvalidDefinition)
 }
 
@@ -349,7 +335,7 @@ func TestManagedNilResultIsRejectedWithoutHooks(t *testing.T) {
 	ref := component.Provide(func() *constructionResource {
 		return nil
 	}, component.Managed[*constructionResource]())
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	err := rt.Start(context.Background())
 	requireSentinel(t, err, component.ErrInvalidValue)
 	if err := rt.Stop(context.Background()); err != nil {
@@ -360,7 +346,7 @@ func TestManagedNilResultIsRejectedWithoutHooks(t *testing.T) {
 func TestRuntimeValueStateAndForeignReferences(t *testing.T) {
 	ref := component.Value(41)
 	foreign := component.Value(41)
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 
 	if _, err := rt.Value(ref); err == nil {
 		t.Fatalf("Value before Start unexpectedly succeeded")
@@ -404,7 +390,7 @@ func TestRuntimeCopySharesStateAndIdentity(t *testing.T) {
 			return nil
 		}}
 	}, component.Managed[*constructionResource]())
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	copy := *rt
 	if err := copy.Start(context.Background()); err != nil {
 		t.Fatalf("Start on copy returned an error")

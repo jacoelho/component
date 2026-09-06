@@ -17,7 +17,7 @@ func BenchmarkNew(b *testing.B) {
 		}
 		b.ReportAllocs()
 		for b.Loop() {
-			if _, err := component.New(component.RuntimeOptions{}, root); err != nil {
+			if _, err := component.New(root); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -30,7 +30,7 @@ func BenchmarkNew(b *testing.B) {
 		}
 		b.ReportAllocs()
 		for b.Loop() {
-			if _, err := component.New(component.RuntimeOptions{}, roots...); err != nil {
+			if _, err := component.New(roots...); err != nil {
 				b.Fatal(err)
 			}
 		}

@@ -233,7 +233,7 @@ func TestPipelineReadinessDrainAndReverseStop(t *testing.T) {
 		component.Managed[*pipelineSource](),
 	)
 
-	runtime, err := component.New(component.RuntimeOptions{}, sourceRef)
+	runtime, err := component.New(sourceRef)
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
@@ -448,7 +448,7 @@ func TestHTTPServerOwnsListenerAndGracefullyDrains(t *testing.T) {
 		},
 		component.Managed[*integrationHTTPServer](),
 	)
-	runtime, err := component.New(component.RuntimeOptions{}, serverRef)
+	runtime, err := component.New(serverRef)
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
@@ -590,7 +590,7 @@ func TestHTTPListenerIsReleasedAfterStartFailure(t *testing.T) {
 		},
 		component.Managed[*integrationHTTPServer](),
 	)
-	runtime, err := component.New(component.RuntimeOptions{}, serverRef)
+	runtime, err := component.New(serverRef)
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}

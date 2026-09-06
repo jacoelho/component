@@ -47,7 +47,7 @@ func TestFourInputCompositionPreservesTypedOrder(t *testing.T) {
 		return fmt.Sprintf("%s/%d/%t/%c", gotA, gotB, gotC, gotD)
 	})
 
-	rt, err := component.New(component.RuntimeOptions{}, ref)
+	rt, err := component.New(ref)
 	if err != nil {
 		t.Fatalf("New returned an error")
 	}
@@ -84,7 +84,7 @@ func TestContextAndErrorConstructorForms(t *testing.T) {
 		return value + "!", nil
 	})
 
-	rt, err := component.New(component.RuntimeOptions{}, contextMapped)
+	rt, err := component.New(contextMapped)
 	if err != nil {
 		t.Fatalf("New returned an error")
 	}
@@ -112,7 +112,7 @@ func TestDeepChainUsesIterativeGraphTraversal(t *testing.T) {
 	for index := 1; index <= depth; index++ {
 		ref = ref.Map(func(previous int) int { return previous + 1 })
 	}
-	rt, err := component.New(component.RuntimeOptions{}, ref)
+	rt, err := component.New(ref)
 	if err != nil {
 		t.Fatalf("New returned an error for a deep chain")
 	}
@@ -149,7 +149,7 @@ func TestDiamondAndWideGraphsDeduplicateSharedDefinitions(t *testing.T) {
 		offset := index
 		roots = append(roots, base.Map(func(value *int) int { return *value + offset }))
 	}
-	rt, err := component.New(component.RuntimeOptions{Parallelism: 8}, roots...)
+	rt, err := component.New(roots...)
 	if err != nil {
 		t.Fatalf("New returned an error for a wide graph")
 	}
@@ -171,7 +171,7 @@ func TestIndependentSameTypeRefsRemainDistinct(t *testing.T) {
 	first := component.Provide(func() int { return 17 })
 	second := component.Provide(func() int { return 23 })
 	combined := first.With(second).Map(func(a, b int) int { return a*100 + b })
-	rt, err := component.New(component.RuntimeOptions{}, combined)
+	rt, err := component.New(combined)
 	if err != nil {
 		t.Fatalf("New returned an error")
 	}

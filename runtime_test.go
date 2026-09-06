@@ -112,7 +112,7 @@ func TestManagedChainStartsInDependencyOrderAndStopsInReverse(t *testing.T) {
 		}
 	}, component.Managed[*runtimeResource]())
 
-	rt := newTestRuntime(t, component.RuntimeOptions{}, dependent)
+	rt := newTestRuntime(t, dependent)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start returned an error")
 	}
@@ -140,9 +140,38 @@ func TestManagedChainStartsInDependencyOrderAndStopsInReverse(t *testing.T) {
 	}
 }
 
+func TestIndependentNodesStartSeriallyAndStopInReverse(t *testing.T) {
+	var mu sync.Mutex
+	var events []string
+	record := func(event string) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, event)
+	}
+	resource := func(name string) component.Ref[*runtimeResource] {
+		return component.Provide(func() *runtimeResource {
+			record(name + ".construct")
+			return &runtimeResource{
+				startFn: func(context.Context) error { record(name + ".start"); return nil },
+				stopFn:  func(context.Context) error { record(name + ".stop"); return nil },
+			}
+		}, component.Managed[*runtimeResource]())
+	}
+	rt := newTestRuntime(t, resource("a"), resource("b"))
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(events, ","), "a.construct,a.start,b.construct,b.start,b.stop,a.stop"; got != want {
+		t.Fatalf("lifecycle order = %s, want %s", got, want)
+	}
+}
+
 func TestFailedStartRetainsSuccessfulOwnershipForCallerStop(t *testing.T) {
 	startFailure := errors.New("sibling construction failed")
-	var sourceStops atomic.Int32
+	var sourceStops, laterCalls atomic.Int32
 	source := component.Provide(func() *runtimeResource {
 		return &runtimeResource{name: "source", stopFn: func(context.Context) error {
 			sourceStops.Add(1)
@@ -152,12 +181,19 @@ func TestFailedStartRetainsSuccessfulOwnershipForCallerStop(t *testing.T) {
 	failing := component.TryProvide(func() (*runtimeResource, error) {
 		return nil, startFailure
 	})
-	rt := newTestRuntime(t, component.RuntimeOptions{}, source, failing)
+	later := component.Provide(func() int {
+		laterCalls.Add(1)
+		return 1
+	})
+	rt := newTestRuntime(t, source, failing, later)
 	if err := rt.Start(context.Background()); err == nil || !errors.Is(err, startFailure) {
 		t.Fatalf("Start did not return the constructor failure")
 	}
 	if got := sourceStops.Load(); got != 0 {
 		t.Fatalf("Start performed implicit cleanup: stop calls=%d", got)
+	}
+	if got := laterCalls.Load(); got != 0 {
+		t.Fatalf("Start continued after failure: later factory calls=%d", got)
 	}
 	if err := rt.Stop(context.Background()); err != nil {
 		t.Fatalf("caller Stop returned an error")
@@ -183,7 +219,7 @@ func TestStartHookFailureTransfersOwnershipBeforeCallingTheHook(t *testing.T) {
 			},
 		}
 	}, component.Managed[*runtimeResource]())
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	if err := rt.Start(context.Background()); err == nil || !errors.Is(err, startFailure) {
 		t.Fatalf("Start did not return the hook failure")
 	}
@@ -191,10 +227,10 @@ func TestStartHookFailureTransfersOwnershipBeforeCallingTheHook(t *testing.T) {
 		t.Fatalf("unexpected hook counts before Stop: starts=%d stops=%d", starts.Load(), stops.Load())
 	}
 	if err := rt.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop returned an error")
+		t.Fatalf("Stop after failed Start returned an error: %v", err)
 	}
-	if stops.Load() != 1 {
-		t.Fatalf("stop calls=%d, want 1", stops.Load())
+	if got := stops.Load(); got != 1 {
+		t.Fatalf("Stop after failed Start called cleanup %d times, want 1", got)
 	}
 }
 
@@ -214,7 +250,7 @@ func TestConstructorValueAndErrorDoesNotTransferOwnership(t *testing.T) {
 			},
 		}, constructionFailure
 	}, component.Managed[*runtimeResource]())
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	if err := rt.Start(context.Background()); err == nil || !errors.Is(err, constructionFailure) {
 		t.Fatalf("Start did not return the constructor failure")
 	}
@@ -240,7 +276,7 @@ func TestStartPanicPreservesConstructedOwnershipAndStack(t *testing.T) {
 			},
 		}
 	}, component.Managed[*runtimeResource]())
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	err := rt.Start(context.Background())
 	requireSentinel(t, err, component.ErrPanic)
 	ne := nodeError(t, err)
@@ -265,7 +301,7 @@ func TestConstructorPanicReportsConstructPhase(t *testing.T) {
 	ref := component.Provide(func() *runtimeResource {
 		panic("construct panic payload")
 	})
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	err := rt.Start(context.Background())
 	requireSentinel(t, err, component.ErrPanic)
 	ne := nodeError(t, err)
@@ -295,7 +331,7 @@ func TestStartGoexitPreservesConstructedOwnership(t *testing.T) {
 			},
 		}
 	}, component.Managed[*runtimeResource]())
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	err := rt.Start(context.Background())
 	requireSentinel(t, err, component.ErrAborted)
 	ne := nodeError(t, err)
@@ -330,7 +366,7 @@ func TestFailedStopLeavesNodePendingAndRetainsDependency(t *testing.T) {
 			return nil
 		}}
 	}, component.Managed[*runtimeResource]())
-	rt := newTestRuntime(t, component.RuntimeOptions{}, child)
+	rt := newTestRuntime(t, child)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start returned an error")
 	}
@@ -356,17 +392,12 @@ func TestFailedStopLeavesNodePendingAndRetainsDependency(t *testing.T) {
 	}
 }
 
-func TestFailedStopDoesNotBlockAnUnrelatedBranch(t *testing.T) {
+func TestFailedStopContinuesUnrelatedCleanup(t *testing.T) {
 	stopFailure := errors.New("branch A stop failed")
 	var aStops, bStops atomic.Int32
-	aEntered := make(chan struct{})
-	releaseA, releaseAOnce := makeRelease(t)
-	bDone := make(chan struct{})
 	a := component.Provide(func() *runtimeResource {
 		return &runtimeResource{name: "a", stopFn: func(context.Context) error {
 			if aStops.Add(1) == 1 {
-				close(aEntered)
-				<-releaseA
 				return stopFailure
 			}
 			return nil
@@ -375,26 +406,20 @@ func TestFailedStopDoesNotBlockAnUnrelatedBranch(t *testing.T) {
 	b := component.Provide(func() *runtimeResource {
 		return &runtimeResource{name: "b", stopFn: func(context.Context) error {
 			bStops.Add(1)
-			close(bDone)
 			return nil
 		}}
 	}, component.Managed[*runtimeResource]())
-	rt := newTestRuntime(t, component.RuntimeOptions{Parallelism: 2}, a, b)
+	rt := newTestRuntime(t, b, a)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start returned an error")
 	}
-	stopResult := make(chan error, 1)
-	go func() { stopResult <- rt.Stop(context.Background()) }()
-	waitSignal(t, aEntered, "branch A stop did not start")
-	waitSignal(t, bDone, "unrelated branch B did not progress")
-	releaseAOnce()
-	first := waitResult(t, stopResult, "Stop did not finish after the blocked callback was released")
+	first := rt.Stop(context.Background())
 	requireSentinel(t, first, component.ErrCleanupPending)
 	if !errors.Is(first, stopFailure) {
 		t.Fatalf("first Stop omitted branch A failure")
 	}
-	if bStops.Load() != 1 {
-		t.Fatalf("branch B stop calls=%d, want 1", bStops.Load())
+	if aStops.Load() != 1 || bStops.Load() != 1 {
+		t.Fatalf("first Stop counts: A=%d B=%d, want 1 each", aStops.Load(), bStops.Load())
 	}
 	if err := rt.Stop(context.Background()); err != nil {
 		t.Fatalf("retry Stop returned an error")
@@ -415,7 +440,7 @@ func TestStopPanicAndGoexitRemainPending(t *testing.T) {
 				return nil
 			}}
 		}, component.Managed[*runtimeResource]())
-		rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+		rt := newTestRuntime(t, ref)
 		if err := rt.Start(context.Background()); err != nil {
 			t.Fatalf("Start returned an error")
 		}
@@ -441,7 +466,7 @@ func TestStopPanicAndGoexitRemainPending(t *testing.T) {
 				return nil
 			}}
 		}, component.Managed[*runtimeResource]())
-		rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+		rt := newTestRuntime(t, ref)
 		if err := rt.Start(context.Background()); err != nil {
 			t.Fatalf("Start returned an error")
 		}
@@ -452,79 +477,6 @@ func TestStopPanicAndGoexitRemainPending(t *testing.T) {
 			t.Fatalf("retry Stop returned an error")
 		}
 	})
-}
-
-func TestParallelismBoundsUserCalls(t *testing.T) {
-	const count = 6
-	var active, peak atomic.Int32
-	entered := make(chan struct{}, count)
-	release, releaseOnce := makeRelease(t)
-	refs := make([]component.Root, 0, count)
-	for index := 0; index < count; index++ {
-		ref := component.Provide(func() int {
-			current := active.Add(1)
-			for {
-				old := peak.Load()
-				if current <= old || peak.CompareAndSwap(old, current) {
-					break
-				}
-			}
-			entered <- struct{}{}
-			<-release
-			active.Add(-1)
-			return 1
-		})
-		refs = append(refs, ref)
-	}
-	rt := newTestRuntime(t, component.RuntimeOptions{Parallelism: 2}, refs...)
-	startResult := make(chan error, 1)
-	go func() { startResult <- rt.Start(context.Background()) }()
-	waitSignal(t, entered, "first bounded callback did not start")
-	waitSignal(t, entered, "second bounded callback did not start")
-	releaseOnce()
-	if err := waitResult(t, startResult, "bounded Start did not finish"); err != nil {
-		t.Fatalf("Start returned an error")
-	}
-	if got := peak.Load(); got != 2 {
-		t.Fatalf("peak concurrency=%d, want exactly 2", got)
-	}
-	if err := rt.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop returned an error")
-	}
-}
-
-func TestDependentAdvancesWithoutAnUnrelatedFrontierBarrier(t *testing.T) {
-	slowEntered := make(chan struct{})
-	releaseSlow, releaseSlowOnce := makeRelease(t)
-	dependentEntered := make(chan struct{})
-	slow := component.Provide(func() int {
-		close(slowEntered)
-		<-releaseSlow
-		return 1
-	})
-	fast := component.Provide(func() int { return 2 })
-	dependent := fast.Map(func(value int) int {
-		close(dependentEntered)
-		return value + 1
-	})
-	rt := newTestRuntime(t, component.RuntimeOptions{Parallelism: 2}, slow, dependent)
-	startResult := make(chan error, 1)
-	go func() { startResult <- rt.Start(context.Background()) }()
-	waitSignal(t, slowEntered, "slow branch did not start")
-	select {
-	case <-dependentEntered:
-	case <-time.After(time.Second):
-		releaseSlowOnce()
-		_ = waitResult(t, startResult, "Start remained blocked behind an unrelated branch")
-		t.Fatal("dependent waited for an unrelated frontier member")
-	}
-	releaseSlowOnce()
-	if err := waitResult(t, startResult, "Start did not finish after slow branch release"); err != nil {
-		t.Fatalf("Start returned an error")
-	}
-	if err := rt.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop returned an error")
-	}
 }
 
 func TestExactContextsReachFactoriesAndHooks(t *testing.T) {
@@ -545,7 +497,7 @@ func TestExactContextsReachFactoriesAndHooks(t *testing.T) {
 			},
 		}, nil
 	}, component.Managed[*runtimeResource]())
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	if err := rt.Start(startContext); err != nil {
 		t.Fatalf("Start returned an error")
 	}
@@ -569,7 +521,7 @@ func TestNilContextsDoNotChangeRuntimeState(t *testing.T) {
 			return nil
 		}}
 	}, component.Managed[*runtimeResource]())
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	//lint:ignore SA1012 nil is the explicit invalid-context contract under test.
 	requireSentinel(t, rt.Start(nil), component.ErrInvalidContext)
 	if creates.Load() != 0 {
@@ -594,7 +546,7 @@ func TestCanceledStartConsumesTheOnlyStartAttempt(t *testing.T) {
 		creates.Add(1)
 		return 1
 	})
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	err := rt.Start(ctx)
@@ -627,56 +579,13 @@ func TestCancellationDuringFactoryStillRunsItsStartHook(t *testing.T) {
 			},
 		}, nil
 	}, component.Managed[*runtimeResource]())
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	err := rt.Start(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Start did not report final cancellation")
 	}
 	if starts.Load() != 1 {
 		t.Fatalf("start hook calls=%d, want 1", starts.Load())
-	}
-	if err := rt.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop returned an error")
-	}
-	if stops.Load() != 1 {
-		t.Fatalf("stop hook calls=%d, want 1", stops.Load())
-	}
-}
-
-func TestCancellationAndSiblingFailureAwaitInFlightStartHook(t *testing.T) {
-	constructionFailure := errors.New("sibling failed")
-	slowEntered := make(chan struct{})
-	releaseSlow, releaseSlowOnce := makeRelease(t)
-	var starts, stops atomic.Int32
-	slow := component.Provide(func() *runtimeResource {
-		close(slowEntered)
-		<-releaseSlow
-		return &runtimeResource{
-			name: "slow",
-			startFn: func(context.Context) error {
-				starts.Add(1)
-				return nil
-			},
-			stopFn: func(context.Context) error {
-				stops.Add(1)
-				return nil
-			},
-		}
-	}, component.Managed[*runtimeResource]())
-	failing := component.TryProvide(func() (*runtimeResource, error) {
-		return nil, constructionFailure
-	})
-	rt := newTestRuntime(t, component.RuntimeOptions{Parallelism: 2}, slow, failing)
-	startResult := make(chan error, 1)
-	go func() { startResult <- rt.Start(context.Background()) }()
-	waitSignal(t, slowEntered, "slow factory did not start")
-	releaseSlowOnce()
-	err := waitResult(t, startResult, "Start did not await in-flight factory")
-	if !errors.Is(err, constructionFailure) {
-		t.Fatalf("Start omitted the sibling failure")
-	}
-	if starts.Load() != 1 {
-		t.Fatalf("in-flight start hook calls=%d, want 1", starts.Load())
 	}
 	if err := rt.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop returned an error")
@@ -702,7 +611,7 @@ func TestCanceledStopWaitsForInFlightCallbackAndRetainsContext(t *testing.T) {
 			return nil
 		}}
 	}, component.Managed[*runtimeResource]())
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start returned an error")
 	}
@@ -725,7 +634,7 @@ func TestCanceledStopWaitsForInFlightCallbackAndRetainsContext(t *testing.T) {
 
 func TestCanceledStopDrainsAnAllPureGraph(t *testing.T) {
 	ref := component.Value("borrowed")
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start returned an error: %v", err)
 	}
@@ -749,7 +658,7 @@ func TestCanceledStopBeforeDispatchLeavesCleanupForRetry(t *testing.T) {
 			return nil
 		}}
 	}, component.Managed[*runtimeResource]())
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start returned an error")
 	}
@@ -778,7 +687,7 @@ func TestOverlappingStartAndStopAreBusy(t *testing.T) {
 		<-release
 		return 1
 	})
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	startResult := make(chan error, 1)
 	go func() { startResult <- rt.Start(context.Background()) }()
 	waitSignal(t, entered, "Start callback did not run")
@@ -802,7 +711,7 @@ func TestOverlappingStopsAreBusy(t *testing.T) {
 			return nil
 		}}
 	}, component.Managed[*runtimeResource]())
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start returned an error")
 	}
@@ -859,7 +768,7 @@ func (*hostileCause) Unwrap() error {
 func TestSchedulerDoesNotFormatOrClassifyUserErrors(t *testing.T) {
 	t.Run("panic Error", func(t *testing.T) {
 		ref := component.TryProvide(func() (int, error) { return 0, &panicError{} })
-		rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+		rt := newTestRuntime(t, ref)
 		err := rt.Start(context.Background())
 		ne := nodeError(t, err)
 		if ne.Cause == nil {
@@ -871,7 +780,7 @@ func TestSchedulerDoesNotFormatOrClassifyUserErrors(t *testing.T) {
 		release, releaseOnce := makeRelease(t)
 		hostile := &blockingError{entered: make(chan struct{}), release: release}
 		ref := component.TryProvide(func() (int, error) { return 0, hostile })
-		rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+		rt := newTestRuntime(t, ref)
 		result := make(chan error, 1)
 		go func() { result <- rt.Start(context.Background()) }()
 		select {
@@ -895,7 +804,7 @@ func TestSchedulerDoesNotFormatOrClassifyUserErrors(t *testing.T) {
 	t.Run("Goexit Error", func(t *testing.T) {
 		hostile := &goexitError{}
 		ref := component.TryProvide(func() (int, error) { return 0, hostile })
-		rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+		rt := newTestRuntime(t, ref)
 		result := make(chan error, 1)
 		go func() { result <- rt.Start(context.Background()) }()
 		select {
@@ -914,7 +823,7 @@ func TestSchedulerDoesNotFormatOrClassifyUserErrors(t *testing.T) {
 	t.Run("hostile classifiers", func(t *testing.T) {
 		cause := &hostileCause{}
 		ref := component.TryProvide(func() (int, error) { return 0, cause })
-		rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+		rt := newTestRuntime(t, ref)
 		err := rt.Start(context.Background())
 		ne := nodeError(t, err)
 		if ne.Cause != cause {
@@ -930,7 +839,7 @@ func TestConstructorGoexitLeavesPartialCleanupWithFactory(t *testing.T) {
 		runtime.Goexit()
 		return nil
 	})
-	rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+	rt := newTestRuntime(t, ref)
 	err := rt.Start(t.Context())
 	requireSentinel(t, err, component.ErrAborted)
 	if got := nodeError(t, err).Phase; got != "construct" {
@@ -946,7 +855,7 @@ func TestConstructorGoexitLeavesPartialCleanupWithFactory(t *testing.T) {
 
 func TestEmptyRuntimeAndStopBeforeStartRemainOneShot(t *testing.T) {
 	t.Run("empty graph", func(t *testing.T) {
-		rt := newTestRuntime(t, component.RuntimeOptions{})
+		rt := newTestRuntime(t)
 		if err := rt.Start(t.Context()); err != nil {
 			t.Fatal(err)
 		}
@@ -961,7 +870,7 @@ func TestEmptyRuntimeAndStopBeforeStartRemainOneShot(t *testing.T) {
 	t.Run("stop before start", func(t *testing.T) {
 		var calls atomic.Int32
 		ref := component.Provide(func() int { calls.Add(1); return 7 })
-		rt := newTestRuntime(t, component.RuntimeOptions{}, ref)
+		rt := newTestRuntime(t, ref)
 		if err := rt.Stop(t.Context()); err != nil {
 			t.Fatal(err)
 		}
@@ -970,43 +879,4 @@ func TestEmptyRuntimeAndStopBeforeStartRemainOneShot(t *testing.T) {
 			t.Fatalf("factory calls = %d, want 0", calls.Load())
 		}
 	})
-}
-
-func TestConcurrentFailuresAreReportedInRootOrder(t *testing.T) {
-	const count = 8
-	entered := make(chan struct{}, count)
-	release, releaseOnce := makeRelease(t)
-	roots := make([]component.Root, count)
-	causes := make([]error, count)
-	for index := range roots {
-		cause := errors.New("independent construction failure")
-		causes[index] = cause
-		roots[index] = component.TryProvide(func() (int, error) {
-			entered <- struct{}{}
-			<-release
-			return 0, cause
-		})
-	}
-	rt := newTestRuntime(t, component.RuntimeOptions{Parallelism: count}, roots...)
-	results := make(chan error, 1)
-	go func() { results <- rt.Start(t.Context()) }()
-	for range count {
-		waitSignal(t, entered, "not all independent factories entered")
-	}
-	releaseOnce()
-	err := waitResult(t, results, "failed factories did not finish")
-	joined, ok := err.(interface{ Unwrap() []error })
-	if !ok {
-		t.Fatalf("concurrent failure lacks aggregate causes: %T", err)
-	}
-	failures := joined.Unwrap()
-	if len(failures) != count {
-		t.Fatalf("failure count = %d, want %d", len(failures), count)
-	}
-	for index, failure := range failures {
-		node := nodeError(t, failure)
-		if node.ID != index+1 || node.Cause != causes[index] {
-			t.Fatalf("failure %d has node ID %d and matching cause %t", index, node.ID, node.Cause == causes[index])
-		}
-	}
 }

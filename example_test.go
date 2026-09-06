@@ -40,7 +40,7 @@ func Example() {
 		return &exampleService{database: database}
 	})
 
-	runtime, err := component.New(component.RuntimeOptions{}, service)
+	runtime, err := component.New(service)
 	if err != nil {
 		panic(err)
 	}

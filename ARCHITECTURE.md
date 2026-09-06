@@ -1,9 +1,7 @@
 # Component architecture
 
-This document is the canonical entry point for the current architecture. The
-rewrite and review history is recorded in [`REWRITE_PLAN.md`](REWRITE_PLAN.md);
-this document records the current implementation decisions that must remain
-true as the code evolves.
+This document is the canonical entry point for the current architecture. It
+records the implementation decisions that must remain true as the code evolves.
 
 ## Capability and ownership
 
@@ -11,8 +9,8 @@ true as the code evolves.
 
 1. It records an immutable, typed construction graph and derives the ordering
    needed for startup and shutdown.
-2. It owns one runtime instance of each reachable definition and schedules
-   construction, readiness, and cleanup with bounded concurrency.
+2. It owns one runtime instance of each reachable definition and runs
+   construction, readiness, and cleanup in deterministic serial order.
 
 Application code owns resource policy. It defines the resource types,
 constructors, readiness handshakes, queue admission, drain or abort behavior,
@@ -53,25 +51,21 @@ reference. Larger constructors use ordinary typed grouping structs and a
 closure.
 
 `New` validates all reachable definitions before user code runs. It rejects
-zero or invalid refs, nil functions, invalid lifecycle options, and cycles.
-The runtime then materializes one instance per reachable definition. Shared
+zero or invalid refs, nil functions, invalid ownership declarations, and
+cycles. The runtime then materializes one instance per reachable definition. Shared
 refs are constructed, started, and stopped once per runtime; independent
 runtimes have independent owned values. Pure mapping nodes remain in the graph
 so that a dependent's lifetime keeps its source alive.
 
-Startup dispatches a node only after all of its inputs are ready. The default
-is serial execution; `RuntimeOptions.Parallelism` bounds user callbacks when
-independent work is available. Scheduling uses stable per-runtime node IDs and
-does not impose a global frontier barrier. On the first observed failure, no
-new work is dispatched, in-flight callbacks are joined, and every transferred
-cleanup obligation remains available to the caller. The runtime never performs
-an implicit rollback.
-
-A dispatch is committed to the complete factory-to-start handoff. If a
-successful factory is followed by cancellation or a sibling failure while it
-is running, its `Start` method still receives the same context. A successful
-factory and its cleanup obligation therefore survive a `Start` method error,
-panic, or `Goexit`.
+`New` computes a deterministic topological order once. Startup walks it
+forward, so each node runs only after all of its inputs are ready. Cleanup
+walks it backward. Independent nodes have no application-defined ordering. A factory and its `Start` method are one dispatch: once a
+factory succeeds, its `Start` method still runs even when the
+operation context is canceled while the factory is returning. On the first
+failure, no later node is dispatched and every transferred cleanup obligation
+remains available to the caller. The runtime never performs an implicit
+rollback. A successful factory and its cleanup obligation therefore survive a
+`Start` method error, panic, or `Goexit`.
 
 For a push pipeline, an ordering requirement must be represented by a typed
 input such as a ready sink or managed connection. The graph cannot infer a
@@ -84,8 +78,7 @@ source ingress stops first, the processor drains, and the sink drains last.
 An owned factory transfers ownership only after it returns a successful value.
 A nonzero value plus an error transfers nothing and invokes no lifecycle
 methods; the factory owns cleanup of any partial acquisition. Once construction
-succeeds,
-the runtime records the cleanup obligation before invoking `Start`. A `Start`
+succeeds, the runtime records the cleanup obligation before invoking `Start`. A `Start`
 method error, panic, or `Goexit` therefore still leaves the constructed resource
 for application cleanup.
 
@@ -98,22 +91,24 @@ retry loop or infer completion from an error value. `Stop` and close methods mus
 be idempotent and retry-safe, including after partial failure. The application
 adapts third-party APIs that do not meet that contract.
 
-Pure nodes have no callback but still participate in dependency completion.
-Unrelated branches may continue cleanup after a failure, within the same
-parallelism bound. The runtime joins every user callback before returning from
-`Start` or `Stop`; no detached goroutine may mutate runtime state afterward.
-When a shutdown context is canceled, eligible pure nodes may still release
-their stored cells because that work cannot invoke user code. Owned callbacks
-that were not dispatched remain pending. If all cleanup has already completed,
-late cancellation does not resurrect it and `Stop` returns nil.
+Pure nodes have no callback but still participate in dependency completion. A
+failed stop leaves its node and dependencies retained, so those dependencies
+are skipped until the dependent succeeds on a later `Stop`; unrelated branches
+continue cleanup in reverse dependency order. Every user callback is isolated
+and joined before the next node or operation proceeds, so at most one callback
+is active and no detached goroutine may mutate runtime state afterward. When a
+shutdown context is canceled, eligible pure nodes may still release their
+stored cells because that work cannot invoke user code. Owned callbacks that
+were not dispatched remain pending. If all cleanup has already completed, late
+cancellation does not resurrect it and `Stop` returns nil.
 
 ## Context, errors, and limits
 
 The caller supplies independent contexts to `Start` and `Stop`. The library
-passes the exact context to context-taking constructors and lifecycle methods. It checks
-cancellation before dispatch, prevents new dispatch after cancellation, waits
-for in-flight callbacks, and returns pending cleanup to the caller. It does
-not create rollback contexts, signal handlers, timeouts, background cleanup, or
+passes the exact context to context-taking constructors and lifecycle methods.
+It checks cancellation before dispatch, prevents new dispatch after
+cancellation, waits for the current callback, and returns pending cleanup to
+the caller. It does not create rollback contexts, signal handlers, timeouts, background cleanup, or
 a `Run` helper. Nil contexts are rejected before state changes. A non-nil
 already-canceled startup context consumes the one startup attempt without
 invoking factories.
@@ -129,24 +124,28 @@ private.
 User errors are retained as causes without invoking their formatting,
 `Is`, `As`, or unwrap methods during scheduling and recovery. Panics and
 `Goexit` are converted to contextual node failures while preserving cleanup
-obligations. Concurrent failures are reported in stable node order, followed
-by the operation's own context error when it is independently relevant.
+obligations. Startup returns the first node failure. Cleanup failures are
+reported in stable node ID order, followed by the pending-cleanup sentinel and
+the operation context error when applicable.
 
 The runtime traverses the finite reachable graph iteratively with O(V+E)
-storage and work. Ready and cleanup queues contain at most V definitions, and
-user callbacks in flight never exceed `Parallelism`. It does not promise a
-throughput target or force callbacks to finish: a user callback that ignores
-cancellation can determine operation latency. Queue admission, message
-limits, worker shutdown, and provider-specific timeouts belong to the
-application owner at the resource boundary.
+storage and work. Execution uses the stored order without runtime scheduling
+queues or dependency counters. One user callback is active at a time. It does not promise a throughput target
+or force callbacks to finish: a user callback that ignores cancellation can
+determine operation latency. Queue admission, message limits, worker shutdown,
+and provider-specific timeouts belong to the application owner at the resource
+boundary.
 
 ## Deliberate exclusions
 
+Parallel execution would overlap slow independent callbacks, but introduces
+scheduling and concurrent failure handling without a demonstrated latency
+requirement. Serial execution keeps ownership and failure sequencing explicit.
+
 Reflection-based registration, global type registries, and runtime resolvers
 would move constructor validation and dependency ownership away from ordinary
-Go calls. Consumer code generation would add a build step without evidence that
-requiring lifecycle methods on every ordinary application type would pollute
-those types. Separate startup and shutdown DAGs would allow
+Go calls. Consumer code generation would add a build step without improving
+the typed constructor contract. Separate startup and shutdown DAGs would allow
 lifetime ordering to diverge from construction ordering. Separate managed
 method families would duplicate each constructor signature without proving
 resource freshness. A single context/error constructor shape would force

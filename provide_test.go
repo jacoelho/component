@@ -180,7 +180,7 @@ func TestConstructionFormsAcrossArities(t *testing.T) {
 						ref = form.build()
 					}
 
-					rt, err := component.New(component.RuntimeOptions{}, ref)
+					rt, err := component.New(ref)
 					if err != nil {
 						t.Fatalf("New returned an error: %v", err)
 					}
@@ -220,7 +220,7 @@ func TestDefinedFactoryAndManagedOwner(t *testing.T) {
 	var factory definedResultFactory = provideZero
 	definedRef := component.Provide(factory)
 	managedRef := component.Provide(provideZero, component.Managed[*testResult]())
-	rt, err := component.New(component.RuntimeOptions{}, definedRef, managedRef)
+	rt, err := component.New(definedRef, managedRef)
 	if err != nil {
 		t.Fatalf("New returned an error: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestContextNoErrorAdaptersAndMoreThanFourInputs(t *testing.T) {
 		},
 		component.Managed[*testResult](),
 	)
-	rt, err := component.New(component.RuntimeOptions{}, adapted, large)
+	rt, err := component.New(adapted, large)
 	if err != nil {
 		t.Fatalf("New returned an error: %v", err)
 	}

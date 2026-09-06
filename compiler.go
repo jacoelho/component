@@ -7,29 +7,16 @@ import (
 	"slices"
 )
 
-// RuntimeOptions bounds concurrent constructor and lifecycle invocations.
-type RuntimeOptions struct {
-	// Parallelism defaults to one when zero. Negative values are invalid.
-	Parallelism int
-}
-
 type graphEntry struct {
-	definition   *definition
-	arguments    []int
-	dependencies []int
-	dependents   []int
+	definition *definition
+	arguments  []int
+	dependents []int
 }
 
-// New validates the roots' dependency closure without invoking constructors.
+// New validates the roots' dependency closure and fixes a serial execution order
+// without invoking constructors.
 // Repeated roots and shared inputs identify the same instance within this runtime.
-func New(options RuntimeOptions, roots ...Root) (*Runtime, error) {
-	if options.Parallelism < 0 {
-		return nil, ErrInvalidOptions
-	}
-	parallelism := options.Parallelism
-	if parallelism == 0 {
-		parallelism = 1
-	}
+func New(roots ...Root) (*Runtime, error) {
 	indices := make(map[*definition]int)
 	var entries []graphEntry
 	var failures []error
@@ -62,41 +49,37 @@ func New(options RuntimeOptions, roots ...Root) (*Runtime, error) {
 	if len(failures) != 0 {
 		return nil, errors.Join(failures...)
 	}
+	remaining := make([]int, len(entries))
 	for index := range entries {
 		for _, input := range entries[index].definition.inputs {
 			dependency := indices[input]
-			entries[index].arguments = append(entries[index].arguments, dependency)
-			if slices.Contains(entries[index].dependencies, dependency) {
-				continue
+			if !slices.Contains(entries[index].arguments, dependency) {
+				remaining[index]++
+				entries[dependency].dependents = append(entries[dependency].dependents, index)
 			}
-			entries[index].dependencies = append(entries[index].dependencies, dependency)
-			entries[dependency].dependents = append(entries[dependency].dependents, index)
+			entries[index].arguments = append(entries[index].arguments, dependency)
 		}
 	}
-	// Public refs cannot form cycles; retain a defensive check at the graph boundary.
-	remaining := make([]int, len(entries))
-	var ready []int
+	// Compute the order once; startup walks it forward and cleanup walks it backward.
+	var order []int
 	for index := range entries {
-		remaining[index] = len(entries[index].dependencies)
 		if remaining[index] == 0 {
-			ready = append(ready, index)
+			order = append(order, index)
 		}
 	}
-	for next := 0; next < len(ready); next++ {
-		for _, dependent := range entries[ready[next]].dependents {
+	for next := 0; next < len(order); next++ {
+		for _, dependent := range entries[order[next]].dependents {
 			remaining[dependent]--
 			if remaining[dependent] == 0 {
-				ready = append(ready, dependent)
+				order = append(order, dependent)
 			}
 		}
 	}
-	if len(ready) != len(entries) {
+	if len(order) != len(entries) {
 		return nil, fmt.Errorf("%w: dependency cycle", ErrInvalidDefinition)
 	}
-	// A larger buffer cannot create useful concurrency beyond the reachable graph.
-	parallelism = min(parallelism, max(1, len(entries)))
 	return &Runtime{core: &runtimeCore{
-		entries: entries, indices: indices, parallelism: parallelism,
+		entries: entries, indices: indices, order: order,
 		values: make([]any, len(entries)),
 	}}, nil
 }
