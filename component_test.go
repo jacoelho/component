@@ -1,354 +1,427 @@
-package component
+package component_test
 
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync/atomic"
 	"testing"
+
+	component "github.com/jacoelho/component"
 )
 
-//nolint:iface,ireturn // Test nodes intentionally exercise the Lifecycle interface type.
-func noOpLifecycle() Lifecycle {
-	return LifecycleFuncs{}
+type constructionResource struct {
+	id      int
+	startFn func(context.Context) error
+	stopFn  func(context.Context) error
 }
 
-type testNode = *Node[Lifecycle]
-
-func newTestNode(label string) testNode {
-	return NewNode[Lifecycle](label)
+type constructionInterface interface {
+	ID() int
 }
 
-func TestNodeIdentity(t *testing.T) {
-	t.Parallel()
-
-	var zero testNode
-	if got := zero.String(); got != "<invalid>" {
-		t.Fatalf("zero Node String() = %q, want %q", got, "<invalid>")
+func (r *constructionResource) ID() int {
+	if r == nil {
+		return 0
 	}
-
-	first := newTestNode("worker")
-	second := newTestNode("worker")
-	copyOfFirst := first
-	if first == second {
-		t.Fatal("nodes created with the same label share identity")
-	}
-	if first != copyOfFirst {
-		t.Fatal("copying a Node pointer did not preserve identity")
-	}
-	if first.String() != "worker" || second.String() != "worker" {
-		t.Fatalf("diagnostic labels changed: %q, %q", first, second)
-	}
-
-	unnamed := newTestNode("")
-	if got := unnamed.String(); got != "" {
-		t.Fatalf("unnamed Node String() = %q, want empty label", got)
-	}
+	return r.id
 }
 
-func TestLifecycleFuncsNilCallbacksAreNoOps(t *testing.T) {
-	t.Parallel()
-
-	lifecycle := LifecycleFuncs{}
-	ctx := context.Background()
-	for phase, invoke := range map[string]func(context.Context) error{
-		"configure": lifecycle.Configure,
-		"start":     lifecycle.Start,
-		"stop":      lifecycle.Stop,
-	} {
-		if err := invoke(ctx); err != nil {
-			t.Errorf("%s returned %v", phase, err)
-		}
+func (r *constructionResource) Start(ctx context.Context) error {
+	if r.startFn == nil {
+		return nil
 	}
+	return r.startFn(ctx)
 }
 
-func TestZeroRegistryIsUsable(t *testing.T) {
-	t.Parallel()
-
-	var configureCalls atomic.Int32
-	var startCalls atomic.Int32
-	var stopCalls atomic.Int32
-	var registry Registry
-
-	if err := registry.Register(NewNode[LifecycleFuncs]("worker"), LifecycleFuncs{
-		OnConfigure: func(context.Context) error {
-			configureCalls.Add(1)
-			return nil
-		},
-		OnStart: func(context.Context) error {
-			startCalls.Add(1)
-			return nil
-		},
-		OnStop: func(context.Context) error {
-			stopCalls.Add(1)
-			return nil
-		},
-	}); err != nil {
-		t.Fatalf("Register() failed: %v", err)
+func (r *constructionResource) Stop(ctx context.Context) error {
+	if r.stopFn == nil {
+		return nil
 	}
+	return r.stopFn(ctx)
+}
 
-	runtime, err := registry.Compile()
+func newTestRuntime(t *testing.T, roots ...component.Root) *component.Runtime {
+	t.Helper()
+	rt, err := component.New(roots...)
 	if err != nil {
-		t.Fatalf("Compile() failed: %v", err)
+		t.Fatalf("New returned an error: %v", err)
 	}
-	if err := runtime.Start(context.Background()); err != nil {
-		t.Fatalf("Start() failed: %v", err)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
+	return rt
+}
 
-	if got := configureCalls.Load(); got != 1 {
-		t.Fatalf("Configure calls = %d, want 1", got)
-	}
-	if got := startCalls.Load(); got != 1 {
-		t.Fatalf("Start calls = %d, want 1", got)
-	}
-	if got := stopCalls.Load(); got != 1 {
-		t.Fatalf("Stop calls = %d, want 1", got)
+func requireSentinel(t *testing.T, err, want error) {
+	t.Helper()
+	if err == nil || !errors.Is(err, want) {
+		t.Fatalf("error did not contain sentinel %v; got %v", want, err)
 	}
 }
 
-func TestZeroRegistryConcurrentFirstUseSharesCore(t *testing.T) {
-	t.Parallel()
-
-	const registrationCount = 32
-	nodes := make([]testNode, registrationCount)
-	for index := range nodes {
-		nodes[index] = newTestNode("worker")
-	}
-
-	var registry Registry
-	start := make(chan struct{})
-	results := make(chan error, registrationCount)
-	for _, node := range nodes {
-		go func() {
-			<-start
-			results <- registry.Register(node, noOpLifecycle())
-		}()
-	}
-	close(start)
-
-	for range nodes {
-		if err := <-results; err != nil {
-			t.Fatalf("concurrent Register() failed: %v", err)
-		}
-	}
-
-	runtime, err := registry.Compile()
-	if err != nil {
-		t.Fatalf("Compile() failed: %v", err)
-	}
-	if got := len(runtime.core.entries); got != registrationCount {
-		t.Fatalf("compiled entry count = %d, want %d", got, registrationCount)
-	}
-}
-
-func BenchmarkParallelRegistryConstruction(b *testing.B) {
-	node := newTestNode("worker")
-	lifecycle := noOpLifecycle()
-	b.ReportAllocs()
-	b.RunParallel(func(iterations *testing.PB) {
-		for iterations.Next() {
-			registry := NewRegistry()
-			if err := registry.Register(node, lifecycle); err != nil {
-				b.Errorf("Register() failed: %v", err)
-				return
-			}
-		}
+func TestDefinitionsDoNotRunFactoriesUntilStart(t *testing.T) {
+	var calls atomic.Int32
+	ref := component.Provide(func() int {
+		calls.Add(1)
+		return 42
 	})
-}
 
-type nilLifecycle struct{}
-
-func (*nilLifecycle) Configure(context.Context) error { return nil }
-func (*nilLifecycle) Start(context.Context) error     { return nil }
-func (*nilLifecycle) Stop(context.Context) error      { return nil }
-
-func TestRegistryAcceptsHeterogeneousTypedDependencies(t *testing.T) {
-	t.Parallel()
-
-	adapterDependency := NewNode[LifecycleFuncs]("adapter")
-	pointerDependency := NewNode[*nilLifecycle]("pointer")
-	owner := NewNode[LifecycleFuncs]("owner")
-	registry := NewRegistry()
-	if err := registry.Register(adapterDependency, LifecycleFuncs{}); err != nil {
-		t.Fatalf("Register(adapter) failed: %v", err)
+	rt := newTestRuntime(t, ref)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("factory calls after New = %d, want 0", got)
 	}
-	if err := registry.Register(pointerDependency, &nilLifecycle{}); err != nil {
-		t.Fatalf("Register(pointer) failed: %v", err)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
 	}
-	dependencies := []NodeRef{adapterDependency, pointerDependency}
-	if err := registry.Register(owner, LifecycleFuncs{}, dependencies...); err != nil {
-		t.Fatalf("Register(owner) failed: %v", err)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("factory calls after Start = %d, want 1", got)
 	}
-	if _, err := registry.Compile(); err != nil {
-		t.Fatalf("Compile() failed: %v", err)
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
 	}
 }
 
-func TestRegistryRejectsInvalidDeclarations(t *testing.T) {
-	t.Parallel()
+func TestNewValidatesAllRootsBeforeRunningAnyFactory(t *testing.T) {
+	var calls atomic.Int32
+	valid := component.Provide(func() int {
+		calls.Add(1)
+		return 7
+	})
+	var invalid component.Ref[string]
 
-	validNode := newTestNode("valid")
-	dependency := newTestNode("dependency")
-	var typedNil *nilLifecycle
-	var typedNilDependency testNode
-
-	tests := []struct {
-		name      string
-		node      testNode
-		lifecycle Lifecycle
-		deps      []NodeRef
-		want      error
-	}{
-		{
-			name:      "zero owner",
-			lifecycle: noOpLifecycle(),
-			want:      ErrInvalidNode,
-		},
-		{
-			name: "nil lifecycle",
-			node: validNode,
-			want: ErrInvalidLifecycle,
-		},
-		{
-			name:      "typed nil lifecycle",
-			node:      validNode,
-			lifecycle: typedNil,
-			want:      ErrInvalidLifecycle,
-		},
-		{
-			name:      "zero dependency",
-			node:      validNode,
-			lifecycle: noOpLifecycle(),
-			deps:      []NodeRef{new(Node[Lifecycle])},
-			want:      ErrInvalidNode,
-		},
-		{
-			name:      "nil dependency reference",
-			node:      validNode,
-			lifecycle: noOpLifecycle(),
-			deps:      []NodeRef{nil},
-			want:      ErrInvalidNode,
-		},
-		{
-			name:      "typed nil dependency reference",
-			node:      validNode,
-			lifecycle: noOpLifecycle(),
-			deps:      []NodeRef{typedNilDependency},
-			want:      ErrInvalidNode,
-		},
-		{
-			name:      "duplicate edge",
-			node:      validNode,
-			lifecycle: noOpLifecycle(),
-			deps:      []NodeRef{dependency, dependency},
-			want:      ErrDuplicateDependency,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			var registry Registry
-			err := registry.Register(test.node, test.lifecycle, test.deps...)
-			if !errors.Is(err, test.want) {
-				t.Fatalf("Register() error = %v, want errors.Is(_, %v)", err, test.want)
-			}
-		})
+	_, err := component.New(valid, invalid)
+	requireSentinel(t, err, component.ErrInvalidReference)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("factory calls after invalid New = %d, want 0", got)
 	}
 }
 
-func TestRegistryRejectsDuplicateRegistration(t *testing.T) {
-	t.Parallel()
-
-	registry := NewRegistry()
-	node := newTestNode("worker")
-	if err := registry.Register(node, noOpLifecycle()); err != nil {
-		t.Fatalf("first Register() failed: %v", err)
+func TestValueIsBorrowedAndFunctionValuesAreNotInvoked(t *testing.T) {
+	var calls atomic.Int32
+	value := func() int {
+		calls.Add(1)
+		return 99
 	}
-	if err := registry.Register(node, noOpLifecycle()); !errors.Is(err, ErrAlreadyRegistered) {
-		t.Fatalf("second Register() error = %v, want ErrAlreadyRegistered", err)
+	ref := component.Value(value)
+	rt := newTestRuntime(t, ref)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
 	}
-}
-
-func TestCompileFailureLeavesRegistryEditable(t *testing.T) {
-	t.Parallel()
-
-	registry := NewRegistry()
-	dependency := newTestNode("dependency")
-	dependent := newTestNode("dependent")
-	if err := registry.Register(dependent, noOpLifecycle(), dependency); err != nil {
-		t.Fatalf("Register(dependent) failed: %v", err)
-	}
-
-	if _, err := registry.Compile(); !errors.Is(err, ErrNotRegistered) {
-		t.Fatalf("Compile() error = %v, want ErrNotRegistered", err)
-	}
-	if err := registry.Register(dependency, noOpLifecycle()); err != nil {
-		t.Fatalf("Register(dependency) after failed Compile() failed: %v", err)
-	}
-	if _, err := registry.Compile(); err != nil {
-		t.Fatalf("Compile() after repair failed: %v", err)
-	}
-}
-
-func TestSuccessfulCompileConsumesRegistry(t *testing.T) {
-	t.Parallel()
-
-	registry := NewRegistry()
-	node := newTestNode("worker")
-	if err := registry.Register(node, noOpLifecycle()); err != nil {
-		t.Fatalf("Register() failed: %v", err)
-	}
-	runtime, err := registry.Compile()
+	got, err := rt.Value(ref)
 	if err != nil {
-		t.Fatalf("Compile() failed: %v", err)
+		t.Fatalf("Value returned an error")
 	}
-	if runtime == nil {
-		t.Fatal("Compile() returned a nil Runtime")
+	if reflect.ValueOf(got).Pointer() != reflect.ValueOf(value).Pointer() {
+		t.Fatalf("Value returned a different function value")
 	}
-	if err := registry.Register(newTestNode("late"), noOpLifecycle()); !errors.Is(err, ErrRegistryConsumed) {
-		t.Fatalf("Register() after Compile() error = %v, want ErrRegistryConsumed", err)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("function value was invoked %d times", got)
 	}
-	if _, err := registry.Compile(); !errors.Is(err, ErrRegistryConsumed) {
-		t.Fatalf("second Compile() error = %v, want ErrRegistryConsumed", err)
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
 	}
 }
 
-func TestCopiedRegistrySharesConsumptionState(t *testing.T) {
-	t.Parallel()
+func TestSharedRefsAndRepeatedRootsMaterializeOnce(t *testing.T) {
+	var created, stopped atomic.Int32
+	base := component.Provide(func() *constructionResource {
+		created.Add(1)
+		return &constructionResource{id: 17, stopFn: func(context.Context) error {
+			stopped.Add(1)
+			return nil
+		}}
+	}, component.Managed[*constructionResource]())
+	left := base.Map(func(r *constructionResource) int { return r.id + 1 })
+	right := base.Map(func(r *constructionResource) int { return r.id + 2 })
 
-	registry := NewRegistry()
-	if err := registry.Register(newTestNode("worker"), noOpLifecycle()); err != nil {
-		t.Fatalf("Register() failed: %v", err)
+	rt := newTestRuntime(t, left, right, left)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
 	}
-	copied := *registry
-	results := make(chan error, 2)
-	go func() {
-		_, err := copied.Compile()
-		results <- err
-	}()
-	go func() {
-		_, err := registry.Compile()
-		results <- err
-	}()
+	if got := created.Load(); got != 1 {
+		t.Fatalf("shared factory calls = %d, want 1", got)
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
+	}
+	if got := stopped.Load(); got != 1 {
+		t.Fatalf("shared stop calls = %d, want 1", got)
+	}
+}
 
-	successes := 0
-	consumed := 0
-	for range 2 {
-		err := <-results
-		switch {
-		case err == nil:
-			successes++
-		case errors.Is(err, ErrRegistryConsumed):
-			consumed++
-		default:
-			t.Fatalf("Compile() through registry copy returned %v", err)
-		}
+func TestUnusedDefinitionsAreNotReachable(t *testing.T) {
+	var used, unused atomic.Int32
+	usedRef := component.Provide(func() int {
+		used.Add(1)
+		return 1
+	})
+	_ = component.Provide(func() int {
+		unused.Add(1)
+		return 2
+	})
+
+	rt := newTestRuntime(t, usedRef)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
 	}
-	if successes != 1 || consumed != 1 {
-		t.Fatalf("Compile() results: successes=%d consumed=%d, want 1 and 1", successes, consumed)
+	if used.Load() != 1 || unused.Load() != 0 {
+		t.Fatalf("reachable calls = %d, unreachable calls = %d; want 1 and 0", used.Load(), unused.Load())
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
+	}
+}
+
+func TestPureMapPreservesTheOwnedDependencyLifetime(t *testing.T) {
+	var stopped atomic.Int32
+	owner := component.Provide(func() *constructionResource {
+		return &constructionResource{id: 23, stopFn: func(context.Context) error {
+			stopped.Add(1)
+			return nil
+		}}
+	}, component.Managed[*constructionResource]())
+	view := owner.Map(func(r *constructionResource) constructionInterface { return r })
+
+	rt := newTestRuntime(t, view)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
+	}
+	got, err := rt.Value(view)
+	if err != nil || got == nil || got.ID() != 23 {
+		t.Fatalf("mapped value was not available")
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
+	}
+	if got := stopped.Load(); got != 1 {
+		t.Fatalf("owner stop calls = %d, want 1", got)
+	}
+}
+
+func TestIndependentRuntimesConstructIndependentOwnedValues(t *testing.T) {
+	var next atomic.Int32
+	var stopped atomic.Int32
+	ref := component.Provide(func() *constructionResource {
+		return &constructionResource{id: int(next.Add(1)), stopFn: func(context.Context) error {
+			stopped.Add(1)
+			return nil
+		}}
+	}, component.Managed[*constructionResource]())
+	one := newTestRuntime(t, ref)
+	two := newTestRuntime(t, ref)
+	if err := one.Start(context.Background()); err != nil {
+		t.Fatalf("first Start returned an error")
+	}
+	if err := two.Start(context.Background()); err != nil {
+		t.Fatalf("second Start returned an error")
+	}
+	oneValue, err := one.Value(ref)
+	if err != nil {
+		t.Fatalf("first Value returned an error")
+	}
+	twoValue, err := two.Value(ref)
+	if err != nil {
+		t.Fatalf("second Value returned an error")
+	}
+	if oneValue == twoValue || oneValue.id == twoValue.id {
+		t.Fatalf("independent runtimes shared an owned value")
+	}
+	if err := one.Stop(context.Background()); err != nil {
+		t.Fatalf("first Stop returned an error")
+	}
+	if err := two.Stop(context.Background()); err != nil {
+		t.Fatalf("second Stop returned an error")
+	}
+	if got := stopped.Load(); got != 2 {
+		t.Fatalf("stop calls = %d, want 2", got)
+	}
+}
+
+func TestInputsPreserveArgumentOrderAndRepeatedArguments(t *testing.T) {
+	var calls atomic.Int32
+	input := component.Value(13)
+	ref := input.With(input).Map(func(first, second int) int {
+		calls.Add(1)
+		return first*100 + second
+	})
+	rt := newTestRuntime(t, ref)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
+	}
+	got, err := rt.Value(ref)
+	if err != nil {
+		t.Fatalf("Value returned an error")
+	}
+	if got != 1313 {
+		t.Fatalf("mapped arguments produced %d, want 1313", got)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("map calls = %d, want 1", got)
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
+	}
+}
+
+func TestTypedInterfaceValuesAndNilInterfacesRemainValid(t *testing.T) {
+	concrete := component.Value(&constructionResource{id: 31})
+	view := concrete.Map(func(r *constructionResource) constructionInterface { return r })
+	var nilInterface constructionInterface
+	nilRef := component.Value(nilInterface)
+
+	rt := newTestRuntime(t, view, nilRef)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
+	}
+	got, err := rt.Value(view)
+	if err != nil || got == nil || got.ID() != 31 {
+		t.Fatalf("interface adaptation did not preserve the concrete value")
+	}
+	nilGot, err := rt.Value(nilRef)
+	if err != nil {
+		t.Fatalf("nil interface Value returned an error")
+	}
+	if nilGot != nil {
+		t.Fatalf("nil interface Value was changed")
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
+	}
+}
+
+func TestTypedNilUnmanagedValuesAreOrdinaryValues(t *testing.T) {
+	var value *constructionResource
+	ref := component.Value(value)
+	rt := newTestRuntime(t, ref)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
+	}
+	got, err := rt.Value(ref)
+	if err != nil {
+		t.Fatalf("Value returned an error")
+	}
+	if got != nil {
+		t.Fatalf("typed nil was changed")
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
+	}
+}
+
+func TestOwnershipValidationHappensAtNew(t *testing.T) {
+	var zero component.Ownership[*constructionResource]
+	withoutOwnership := component.Provide(func() *constructionResource {
+		return &constructionResource{}
+	}, zero)
+	_, err := component.New(withoutOwnership)
+	requireSentinel(t, err, component.ErrInvalidDefinition)
+
+	withTwo := component.Provide(func() *constructionResource {
+		return &constructionResource{}
+	},
+		component.Managed[*constructionResource](),
+		component.Managed[*constructionResource](),
+	)
+	_, err = component.New(withTwo)
+	requireSentinel(t, err, component.ErrInvalidDefinition)
+}
+
+func TestNilConstructorsAreRejectedBeforeStart(t *testing.T) {
+	var create func() int
+	ref := component.Provide(create)
+	_, err := component.New(ref)
+	requireSentinel(t, err, component.ErrInvalidDefinition)
+}
+
+func TestManagedNilResultIsRejectedWithoutHooks(t *testing.T) {
+	ref := component.Provide(func() *constructionResource {
+		return nil
+	}, component.Managed[*constructionResource]())
+	rt := newTestRuntime(t, ref)
+	err := rt.Start(context.Background())
+	requireSentinel(t, err, component.ErrInvalidValue)
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop after rejected nil result returned an error")
+	}
+}
+
+func TestRuntimeValueStateAndForeignReferences(t *testing.T) {
+	ref := component.Value(41)
+	foreign := component.Value(41)
+	rt := newTestRuntime(t, ref)
+
+	if _, err := rt.Value(ref); err == nil {
+		t.Fatalf("Value before Start unexpectedly succeeded")
+	} else {
+		requireSentinel(t, err, component.ErrUnavailable)
+	}
+	if _, err := rt.Value(foreign); err == nil {
+		t.Fatalf("foreign Value before Start unexpectedly succeeded")
+	} else {
+		requireSentinel(t, err, component.ErrUnavailable)
+	}
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
+	}
+	if got, err := rt.Value(ref); err != nil || got != 41 {
+		t.Fatalf("running Value = %d, error present=%t", got, err != nil)
+	}
+	if _, err := rt.Value(foreign); err == nil {
+		t.Fatalf("Value for a foreign ref unexpectedly succeeded")
+	} else {
+		requireSentinel(t, err, component.ErrInvalidReference)
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
+	}
+	if _, err := rt.Value(ref); err == nil {
+		t.Fatalf("Value after Stop unexpectedly succeeded")
+	} else {
+		requireSentinel(t, err, component.ErrUnavailable)
+	}
+}
+
+func TestRuntimeCopySharesStateAndIdentity(t *testing.T) {
+	var starts, stops atomic.Int32
+	ref := component.Provide(func() *constructionResource {
+		return &constructionResource{id: 5, startFn: func(context.Context) error {
+			starts.Add(1)
+			return nil
+		}, stopFn: func(context.Context) error {
+			stops.Add(1)
+			return nil
+		}}
+	}, component.Managed[*constructionResource]())
+	rt := newTestRuntime(t, ref)
+	copy := *rt
+	if err := copy.Start(context.Background()); err != nil {
+		t.Fatalf("Start on copy returned an error")
+	}
+	if _, err := rt.Value(ref); err != nil {
+		t.Fatalf("Value through original copy returned an error")
+	}
+	if err := rt.Start(context.Background()); err == nil {
+		t.Fatalf("Start through original copy unexpectedly succeeded")
+	} else {
+		requireSentinel(t, err, component.ErrAlreadyStarted)
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop through original copy returned an error")
+	}
+	if starts.Load() != 1 || stops.Load() != 1 {
+		t.Fatalf("copy changed lifecycle counts: starts=%d stops=%d", starts.Load(), stops.Load())
+	}
+}
+
+func TestNilAndZeroRuntimeAreInvalid(t *testing.T) {
+	var rt *component.Runtime
+	if err := rt.Start(context.Background()); err == nil {
+		t.Fatalf("nil Runtime Start unexpectedly succeeded")
+	} else {
+		requireSentinel(t, err, component.ErrInvalidRuntime)
+	}
+	var zero component.Runtime
+	if err := zero.Start(context.Background()); err == nil {
+		t.Fatalf("zero Runtime Start unexpectedly succeeded")
+	} else {
+		requireSentinel(t, err, component.ErrInvalidRuntime)
 	}
 }

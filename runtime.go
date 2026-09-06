@@ -3,9 +3,7 @@ package component
 import (
 	"context"
 	"errors"
-	"fmt"
 	"runtime/debug"
-	"sort"
 	"sync"
 )
 
@@ -20,391 +18,218 @@ const (
 	runtimeStopped
 )
 
-// Runtime owns a compiled lifecycle graph. Copies share the same runtime
-// identity. It is one-shot: after any Start attempt or any Stop call it cannot
-// be started again. A zero Runtime is invalid.
-type Runtime struct {
-	core *runtimeCore
-}
+// Runtime owns one instance of each reachable definition. Copies share state.
+// It is one-shot, and its zero value is invalid.
+type Runtime struct{ core *runtimeCore }
 
 type runtimeCore struct {
-	entries   []runtimeEntry
-	frontiers [][]int
-	cleanup   []bool
-	mu        sync.Mutex
-	state     runtimeState
+	mu      sync.Mutex
+	state   runtimeState
+	entries []graphEntry
+	indices map[*definition]int
+	order   []int
+	// Only the active operation writes cells. Value reads them under mu solely
+	// while running, when no operation may mutate them.
+	values []any
 }
 
-type runtimeEntry struct {
-	graphEntry
-	lifecycle Lifecycle
-}
-
-type lifecyclePhase string
-
-const (
-	phaseConfigure lifecyclePhase = "configure"
-	phaseStart     lifecyclePhase = "start"
-	phaseStop      lifecyclePhase = "stop"
-)
-
-type indexedError struct {
-	err   error
-	index int
-}
-
-// Start configures the complete graph and then starts it. Dependency
-// frontiers run in order; nodes within a frontier run concurrently. Start does
-// not call Stop after a failure; the caller decides whether and how to clean up
-// nodes whose Configure callback was invoked.
+// Start constructs nodes serially after their dependencies are ready, then calls Start
+// on managed results. It never rolls back. Call Stop even after failed startup.
+// Cancellation prevents the next node from starting and waits for the current callback.
 func (rt *Runtime) Start(ctx context.Context) error {
 	if rt == nil || rt.core == nil {
-		return errors.New("component: start on invalid runtime")
+		return ErrInvalidRuntime
 	}
-	return rt.core.start(ctx)
-}
-
-func (rt *runtimeCore) start(ctx context.Context) error {
 	if ctx == nil {
-		return errors.New("component: Start called with nil context")
+		return ErrInvalidContext
 	}
-
-	rt.mu.Lock()
-	switch rt.state {
-	case runtimeIdle:
-		rt.state = runtimeStarting
-	case runtimeCleanupPending:
-		rt.mu.Unlock()
-		return ErrCleanupPending
+	core := rt.core
+	core.mu.Lock()
+	switch core.state {
 	case runtimeStarting, runtimeStopping:
-		rt.mu.Unlock()
-		return ErrRuntimeBusy
-	case runtimeRunning, runtimeStopped:
-		rt.mu.Unlock()
+		core.mu.Unlock()
+		return ErrBusy
+	case runtimeIdle:
+		core.state = runtimeStarting
+	default:
+		core.mu.Unlock()
 		return ErrAlreadyStarted
+	}
+	core.mu.Unlock()
+	err := core.start(ctx)
+	core.mu.Lock()
+	switch {
+	case err == nil:
+		core.state = runtimeRunning
+	case core.hasValues():
+		core.state = runtimeCleanupPending
 	default:
-		rt.mu.Unlock()
-		return errors.New("component: invalid runtime state")
+		core.state = runtimeStopped
 	}
-	rt.mu.Unlock()
-
-	if err := rt.runConfigure(ctx); err != nil {
-		return rt.failStart(err)
-	}
-	if err := rt.runStart(ctx); err != nil {
-		return rt.failStart(err)
-	}
-
-	rt.mu.Lock()
-	rt.state = runtimeRunning
-	rt.mu.Unlock()
-	return nil
-}
-
-func (rt *runtimeCore) runConfigure(ctx context.Context) error {
-	for _, frontier := range rt.frontiers {
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("component: configure cancelled: %w", err)
-		}
-		rt.mu.Lock()
-		for _, index := range frontier {
-			rt.cleanup[index] = true
-		}
-		rt.mu.Unlock()
-
-		if err := rt.invokeFrontier(ctx, frontier, phaseConfigure); err != nil {
-			return err
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("component: configure cancelled: %w", err)
-	}
-	return nil
-}
-
-func (rt *runtimeCore) runStart(ctx context.Context) error {
-	for _, frontier := range rt.frontiers {
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("component: start cancelled: %w", err)
-		}
-		if err := rt.invokeFrontier(ctx, frontier, phaseStart); err != nil {
-			return err
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("component: start cancelled: %w", err)
-	}
-	return nil
-}
-
-func (rt *runtimeCore) failStart(startErr error) error {
-	rt.mu.Lock()
-	if rt.hasCleanupLocked() {
-		rt.state = runtimeCleanupPending
-	} else {
-		rt.state = runtimeStopped
-	}
-	rt.mu.Unlock()
-	return startErr
-}
-
-// Stop releases every configured or started node in reverse dependency order.
-// It is idempotent after complete cleanup and retryable after incomplete
-// cleanup. Calling Stop before Start returns nil without invoking callbacks and
-// consumes the one-shot runtime. Stop passes the caller's context directly to
-// lifecycle callbacks.
-func (rt *Runtime) Stop(ctx context.Context) error {
-	if rt == nil || rt.core == nil {
-		return errors.New("component: stop on invalid runtime")
-	}
-	return rt.core.stop(ctx)
-}
-
-func (rt *runtimeCore) stop(ctx context.Context) error {
-	if ctx == nil {
-		return errors.New("component: Stop called with nil context")
-	}
-
-	rt.mu.Lock()
-	switch rt.state {
-	case runtimeIdle:
-		rt.state = runtimeStopped
-		rt.mu.Unlock()
-		return nil
-	case runtimeStopped:
-		rt.mu.Unlock()
-		return nil
-	case runtimeRunning, runtimeCleanupPending:
-		rt.state = runtimeStopping
-	case runtimeStarting, runtimeStopping:
-		rt.mu.Unlock()
-		return ErrRuntimeBusy
-	default:
-		rt.mu.Unlock()
-		return errors.New("component: invalid runtime state")
-	}
-	rt.mu.Unlock()
-
-	err := rt.stopRemaining(ctx)
-	rt.mu.Lock()
-	if rt.hasCleanupLocked() {
-		rt.state = runtimeCleanupPending
-	} else {
-		rt.state = runtimeStopped
-	}
-	rt.mu.Unlock()
+	core.mu.Unlock()
 	return err
 }
 
-func (rt *runtimeCore) stopRemaining(ctx context.Context) error {
-	rt.mu.Lock()
-	active := append([]bool(nil), rt.cleanup...)
-	rt.mu.Unlock()
-
-	activeCount := 0
-	activeDependents := make([]int, len(rt.entries))
-	for index, requiresCleanup := range active {
-		if !requiresCleanup {
-			continue
+func (rt *runtimeCore) start(ctx context.Context) error {
+	for _, index := range rt.order {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		activeCount++
-		for _, dependent := range rt.entries[index].dependents {
-			if active[dependent] {
-				activeDependents[index]++
-			}
+		entry := rt.entries[index]
+		arguments := make([]any, len(entry.arguments))
+		for position, dependency := range entry.arguments {
+			arguments[position] = rt.values[dependency]
 		}
-	}
-	if activeCount == 0 {
-		return nil
-	}
-
-	results := make(chan indexedError, activeCount)
-	launched := make([]bool, len(rt.entries))
-	inFlight := 0
-	launch := func(index int) {
-		launched[index] = true
-		inFlight++
-		go invokeLifecycle(
-			ctx,
-			index,
-			rt.entries[index],
-			phaseStop,
-			results,
-		)
-	}
-	for index, requiresCleanup := range active {
-		if requiresCleanup && activeDependents[index] == 0 {
-			launch(index)
-		}
-	}
-	if inFlight == 0 {
-		return errors.New("component: cleanup graph has no eligible node")
-	}
-
-	failures := make([]error, len(rt.entries))
-	for inFlight != 0 {
-		result := <-results
-		inFlight--
+		result := invokeNode(ctx, index, entry.definition, arguments, nil)
+		// A transferred cell survives even if its Start hook failed or aborted.
+		rt.values[index] = result.value
 		if result.err != nil {
-			failures[result.index] = result.err
-			continue
-		}
-
-		active[result.index] = false
-		rt.mu.Lock()
-		rt.cleanup[result.index] = false
-		rt.mu.Unlock()
-		for _, dependency := range rt.entries[result.index].dependencies {
-			if !active[dependency] {
-				continue
-			}
-			activeDependents[dependency]--
-			if !launched[dependency] &&
-				activeDependents[dependency] == 0 {
-				launch(dependency)
-			}
+			return errors.Join(result.err, ctx.Err())
 		}
 	}
-
-	errs := make([]error, 0, activeCount)
-	for _, failure := range failures {
-		if failure != nil {
-			errs = append(errs, failure)
-		}
-	}
-	return joinErrors(errs)
+	return ctx.Err()
 }
 
-func (rt *runtimeCore) hasCleanupLocked() bool {
-	for _, active := range rt.cleanup {
-		if active {
+// Stop releases constructed nodes after all their constructed dependents finish.
+// A failed Stop remains pending and retains dependencies. The caller must make
+// Stop idempotent, including after partial failure. Each call attempts an
+// eligible node once; completed stops never repeat. Contexts are passed unchanged.
+func (rt *Runtime) Stop(ctx context.Context) error {
+	if rt == nil || rt.core == nil {
+		return ErrInvalidRuntime
+	}
+	if ctx == nil {
+		return ErrInvalidContext
+	}
+	core := rt.core
+	core.mu.Lock()
+	switch core.state {
+	case runtimeStarting, runtimeStopping:
+		core.mu.Unlock()
+		return ErrBusy
+	case runtimeIdle, runtimeStopped:
+		core.state = runtimeStopped
+		core.mu.Unlock()
+		return nil
+	default:
+		core.state = runtimeStopping
+	}
+	core.mu.Unlock()
+	err := core.stop(ctx)
+	core.mu.Lock()
+	if core.hasValues() {
+		core.state = runtimeCleanupPending
+	} else {
+		core.state = runtimeStopped
+	}
+	core.mu.Unlock()
+	return err
+}
+
+func (rt *runtimeCore) stop(ctx context.Context) error {
+	failures := make([]error, len(rt.entries))
+next:
+	for position := len(rt.order) - 1; position >= 0; position-- {
+		index := rt.order[position]
+		if rt.values[index] == nil {
+			continue
+		}
+		entry := rt.entries[index]
+		for _, dependent := range entry.dependents {
+			if rt.values[dependent] != nil {
+				continue next
+			}
+		}
+		if entry.definition.stop != nil {
+			if ctx.Err() != nil {
+				continue
+			}
+			result := invokeNode(ctx, index, entry.definition, nil, rt.values[index])
+			if result.err != nil {
+				failures[index] = result.err
+				continue
+			}
+		}
+		// Pure nodes can complete even after cancellation without invoking user code.
+		rt.values[index] = nil
+	}
+	if rt.hasValues() {
+		failures = append(failures, ErrCleanupPending, ctx.Err())
+	}
+	return errors.Join(failures...)
+}
+
+// Value returns a borrowed instance only while the runtime is successfully
+// running. The caller must stop using it before calling Stop.
+func (rt *Runtime) Value[T any](ref Ref[T]) (T, error) {
+	var zero T
+	if rt == nil || rt.core == nil {
+		return zero, ErrInvalidRuntime
+	}
+	core := rt.core
+	core.mu.Lock()
+	defer core.mu.Unlock()
+	if core.state != runtimeRunning {
+		return zero, ErrUnavailable
+	}
+	index, exists := core.indices[ref.node]
+	if !exists {
+		return zero, ErrInvalidReference
+	}
+	return core.values[index].(*valueCell[T]).value, nil
+}
+
+func (rt *runtimeCore) hasValues() bool {
+	for _, value := range rt.values {
+		if value != nil {
 			return true
 		}
 	}
 	return false
 }
 
-func (rt *runtimeCore) invokeFrontier(
-	ctx context.Context,
-	frontier []int,
-	phase lifecyclePhase,
-) error {
-	results := rt.invokeFrontierErrors(ctx, frontier, phase)
-	errs := make([]error, 0, len(results))
-	for _, result := range results {
+type invocationResult struct {
+	value any
+	err   error
+}
+
+// Isolation prevents Goexit from terminating the runtime's caller. Deferred
+// publication preserves transferred ownership through a Start panic or Goexit.
+func invokeNode(ctx context.Context, index int, node *definition, arguments []any, value any) invocationResult {
+	results := make(chan invocationResult)
+	go func() {
+		result := invocationResult{value: value}
+		phase := "construct"
+		returned := false
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				cause, _ := recovered.(error)
+				failure := nodeFailure(index, node, phase, cause)
+				failure.kind = ErrPanic
+				failure.panicValue = recovered
+				failure.Stack = debug.Stack()
+				result.err = failure
+			} else if !returned {
+				failure := nodeFailure(index, node, phase, nil)
+				failure.kind = ErrAborted
+				result.err = failure
+			}
+			results <- result
+		}()
+		if value != nil {
+			phase = "stop"
+			result.err = node.stop(ctx, value)
+		} else {
+			result.value, result.err = node.create(ctx, arguments)
+			if result.err == nil && node.start != nil {
+				phase = "start"
+				result.err = node.start(ctx, result.value)
+			}
+		}
 		if result.err != nil {
-			errs = append(errs, result.err)
+			result.err = nodeFailure(index, node, phase, result.err)
 		}
-	}
-	return joinErrors(errs)
-}
-
-func (rt *runtimeCore) invokeFrontierErrors(
-	ctx context.Context,
-	frontier []int,
-	phase lifecyclePhase,
-) []indexedError {
-	resultChannel := make(chan indexedError, len(frontier))
-	for _, index := range frontier {
-		entry := rt.entries[index]
-		go invokeLifecycle(ctx, index, entry, phase, resultChannel)
-	}
-
-	results := make([]indexedError, 0, len(frontier))
-	for range frontier {
-		results = append(results, <-resultChannel)
-	}
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].index < results[j].index
-	})
-	return results
-}
-
-func invokeLifecycle(
-	ctx context.Context,
-	index int,
-	entry runtimeEntry,
-	phase lifecyclePhase,
-	results chan<- indexedError,
-) {
-	returned := false
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			results <- indexedError{
-				index: index,
-				err:   lifecyclePanicError(entry.node, phase, recovered),
-			}
-			return
-		}
-		if !returned {
-			results <- indexedError{
-				index: index,
-				err: fmt.Errorf(
-					"%w: node %q phase %s",
-					ErrLifecycleAborted,
-					entry.node.label,
-					phase,
-				),
-			}
-		}
+		returned = true
 	}()
-
-	var err error
-	switch phase {
-	case phaseConfigure:
-		err = entry.lifecycle.Configure(ctx)
-	case phaseStart:
-		err = entry.lifecycle.Start(ctx)
-	case phaseStop:
-		err = entry.lifecycle.Stop(ctx)
-	default:
-		err = errors.New("component: unknown lifecycle phase")
-	}
-	returned = true
-	if err != nil {
-		err = fmt.Errorf(
-			"component: node %q phase %s: %w",
-			entry.node.label,
-			phase,
-			err,
-		)
-	}
-	results <- indexedError{index: index, err: err}
-}
-
-func lifecyclePanicError(
-	node nodeDescriptor,
-	phase lifecyclePhase,
-	recovered any,
-) error {
-	stack := debug.Stack()
-	if cause, ok := recovered.(error); ok {
-		return fmt.Errorf(
-			"%w: node %q phase %s: %w\n%s",
-			ErrPanic,
-			node.label,
-			phase,
-			cause,
-			stack,
-		)
-	}
-	return fmt.Errorf(
-		"%w: node %q phase %s: %v\n%s",
-		ErrPanic,
-		node.label,
-		phase,
-		recovered,
-		stack,
-	)
-}
-
-func joinErrors(errs []error) error {
-	switch len(errs) {
-	case 0:
-		return nil
-	case 1:
-		return errs[0]
-	default:
-		return errors.Join(errs...)
-	}
+	return <-results
 }

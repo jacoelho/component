@@ -1,302 +1,191 @@
-package component
+package component_test
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"reflect"
-	"strings"
+	"sync/atomic"
 	"testing"
+
+	component "github.com/jacoelho/component"
 )
 
-func TestCompileBuildsDeterministicFrontiers(t *testing.T) {
-	t.Parallel()
+type constructorContextKey struct{}
 
-	alpha := newTestNode("alpha")
-	beta := newTestNode("beta")
-	charlie := newTestNode("charlie")
-	delta := newTestNode("delta")
-	queen := newTestNode("queen")
-	xray := newTestNode("xray")
-	zulu := newTestNode("zulu")
-
-	registry := NewRegistry()
-	registrations := []struct {
-		node testNode
-		deps []NodeRef
-	}{
-		{node: queen, deps: []NodeRef{delta, xray}},
-		{node: xray, deps: []NodeRef{charlie}},
-		{node: delta, deps: []NodeRef{zulu}},
-		{node: zulu, deps: []NodeRef{alpha}},
-		{node: charlie, deps: []NodeRef{beta}},
-		{node: beta},
-		{node: alpha},
+func TestRefRejectsTagOnlyConversions(t *testing.T) {
+	type before = struct {
+		Value int `json:"before"`
 	}
-	for _, registration := range registrations {
-		if err := registry.Register(
-			registration.node,
-			noOpLifecycle(),
-			registration.deps...,
-		); err != nil {
-			t.Fatalf("Register(%q) failed: %v", registration.node, err)
+	type after = struct {
+		Value int `json:"after"`
+	}
+	from := reflect.TypeFor[component.Ref[before]]()
+	to := reflect.TypeFor[component.Ref[after]]()
+	if from.ConvertibleTo(to) {
+		t.Fatal("references with different value types must not be convertible, including tag-only differences")
+	}
+}
+
+func TestRefRemainsComparableForNonComparableValues(t *testing.T) {
+	for _, typ := range []reflect.Type{
+		reflect.TypeFor[component.Ref[[]byte]](),
+		reflect.TypeFor[component.Ref[map[string]int]](),
+		reflect.TypeFor[component.Ref[func()]](),
+	} {
+		if !typ.Comparable() {
+			t.Errorf("%v must be comparable", typ)
 		}
 	}
+}
 
-	runtime, err := registry.Compile()
+func TestFourInputCompositionPreservesTypedOrder(t *testing.T) {
+	a := component.Value("a")
+	b := component.Value(2)
+	c := component.Value(true)
+	d := component.Value(byte('d'))
+	ref := a.With(b).With(c).With(d).Map(func(gotA string, gotB int, gotC bool, gotD byte) string {
+		return fmt.Sprintf("%s/%d/%t/%c", gotA, gotB, gotC, gotD)
+	})
+
+	rt, err := component.New(ref)
 	if err != nil {
-		t.Fatalf("Compile() failed: %v", err)
+		t.Fatalf("New returned an error")
 	}
-	got := frontierLabels(runtime)
-	want := [][]string{
-		{"alpha", "beta"},
-		{"charlie", "zulu"},
-		{"delta", "xray"},
-		{"queen"},
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("frontiers = %v, want %v", got, want)
-	}
-}
-
-func TestCompileRejectsCyclesWithWitness(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		make func(*testing.T, *Registry)
-		want []string
-	}{
-		{
-			name: "self",
-			make: func(t *testing.T, registry *Registry) {
-				t.Helper()
-
-				node := newTestNode("self")
-				mustRegister(t, registry, node, node)
-			},
-			want: []string{"self -> self"},
-		},
-		{
-			name: "three nodes",
-			make: func(t *testing.T, registry *Registry) {
-				t.Helper()
-
-				a := newTestNode("a")
-				b := newTestNode("b")
-				c := newTestNode("c")
-				mustRegister(t, registry, a, b)
-				mustRegister(t, registry, b, c)
-				mustRegister(t, registry, c, a)
-			},
-			want: []string{"a", "b", "c", " -> "},
-		},
-		{
-			name: "after acyclic prefix",
-			make: func(t *testing.T, registry *Registry) {
-				t.Helper()
-
-				root := newTestNode("root")
-				leaf := newTestNode("leaf")
-				cycleA := newTestNode("cycle-a")
-				cycleB := newTestNode("cycle-b")
-				mustRegister(t, registry, root)
-				mustRegister(t, registry, leaf, root)
-				mustRegister(t, registry, cycleA, cycleB)
-				mustRegister(t, registry, cycleB, cycleA)
-			},
-			want: []string{"cycle-a", "cycle-b", " -> "},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			registry := NewRegistry()
-			test.make(t, registry)
-			_, err := registry.Compile()
-			if !errors.Is(err, ErrCyclicDependency) {
-				t.Fatalf("Compile() error = %v, want ErrCyclicDependency", err)
-			}
-			for _, text := range test.want {
-				if !strings.Contains(err.Error(), text) {
-					t.Errorf("Compile() error %q does not contain %q", err, text)
-				}
-			}
-		})
-	}
-}
-
-func TestCompileHandlesVeryDeepGraphsIteratively(t *testing.T) {
-	if testing.Short() {
-		t.Skip("deep graph")
-	}
-
-	const nodeCount = 25_000
-	registry := NewRegistry()
-	var previous testNode
-	for index := range nodeCount {
-		node := newTestNode(fmt.Sprintf("node-%05d", index))
-		if index == 0 {
-			mustRegister(t, registry, node)
-		} else {
-			mustRegister(t, registry, node, previous)
-		}
-		previous = node
-	}
-
-	runtime, err := registry.Compile()
+	got, err := rt.Value(ref)
 	if err != nil {
-		t.Fatalf("Compile() failed: %v", err)
+		t.Fatalf("Value returned an error")
 	}
-	if got := len(runtime.core.frontiers); got != nodeCount {
-		t.Fatalf("frontier count = %d, want %d", got, nodeCount)
+	if got != "a/2/true/d" {
+		t.Fatalf("four-input result = %q, want %q", got, "a/2/true/d")
 	}
-}
-
-func TestCompileFindsCycleInVeryDeepResidualGraphIteratively(t *testing.T) {
-	if testing.Short() {
-		t.Skip("deep graph")
-	}
-
-	const nodeCount = 20_000
-	nodes := make([]testNode, nodeCount)
-	for index := range nodes {
-		nodes[index] = newTestNode(fmt.Sprintf("cycle-%05d", index))
-	}
-	registry := NewRegistry()
-	for index, node := range nodes {
-		dependency := nodes[(index+nodeCount-1)%nodeCount]
-		mustRegister(t, registry, node, dependency)
-	}
-
-	_, err := registry.Compile()
-	if !errors.Is(err, ErrCyclicDependency) {
-		t.Fatalf("Compile() error = %v, want ErrCyclicDependency", err)
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
 	}
 }
 
-func TestCompileAllowsDistinctNodesWithRepeatedLabels(t *testing.T) {
-	t.Parallel()
+func TestContextAndErrorConstructorForms(t *testing.T) {
+	ctxKey := constructorContextKey{}
+	wantContext := context.WithValue(context.Background(), ctxKey, "startup")
+	var seen context.Context
+	provided := component.ProvideContext(func(ctx context.Context) (int, error) {
+		seen = ctx
+		return 3, nil
+	})
+	tried := provided.TryMap(func(value int) (string, error) {
+		return fmt.Sprintf("%d", value), nil
+	})
+	contextMapped := tried.MapContext(func(ctx context.Context, value string) (string, error) {
+		if ctx.Value(ctxKey) != "startup" {
+			return "", fmt.Errorf("wrong context")
+		}
+		return value + "!", nil
+	})
 
-	first := newTestNode("worker")
-	second := newTestNode("worker")
-	registry := NewRegistry()
-	mustRegister(t, registry, second)
-	mustRegister(t, registry, first)
-
-	runtime, err := registry.Compile()
+	rt, err := component.New(contextMapped)
 	if err != nil {
-		t.Fatalf("Compile() failed: %v", err)
+		t.Fatalf("New returned an error")
 	}
-	if len(runtime.core.entries) != 2 {
-		t.Fatalf("entry count = %d, want 2", len(runtime.core.entries))
+	if err := rt.Start(wantContext); err != nil {
+		t.Fatalf("Start returned an error")
 	}
-	if runtime.core.entries[0].node.identity == runtime.core.entries[1].node.identity {
-		t.Fatal("repeated labels collapsed distinct identities")
+	if seen != wantContext {
+		t.Fatalf("context constructor did not receive the exact startup context")
 	}
-	if runtime.core.entries[0].node.ordinal >= runtime.core.entries[1].node.ordinal {
-		t.Fatal("equal-label entries are not ordered by creation ordinal")
+	got, err := rt.Value(contextMapped)
+	if err != nil {
+		t.Fatalf("Value returned an error")
 	}
-}
-
-func TestMissingDependencyDiagnosticIgnoresArgumentOrder(t *testing.T) {
-	t.Parallel()
-
-	owner := newTestNode("owner")
-	alpha := newTestNode("alpha")
-	zeta := newTestNode("zeta")
-	first := NewRegistry()
-	second := NewRegistry()
-	mustRegister(t, first, owner, zeta, alpha)
-	mustRegister(t, second, owner, alpha, zeta)
-
-	_, firstErr := first.Compile()
-	_, secondErr := second.Compile()
-	if !errors.Is(firstErr, ErrNotRegistered) || !errors.Is(secondErr, ErrNotRegistered) {
-		t.Fatalf("Compile() errors = %v and %v, want ErrNotRegistered", firstErr, secondErr)
+	if got != "3!" {
+		t.Fatalf("context/error result = %q, want %q", got, "3!")
 	}
-	if firstErr.Error() != secondErr.Error() {
-		t.Fatalf("missing-dependency diagnostics differ: %q != %q", firstErr, secondErr)
-	}
-	if !strings.Contains(firstErr.Error(), "alpha") {
-		t.Fatalf("diagnostic %q did not select least missing node", firstErr)
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
 	}
 }
 
-func BenchmarkCompileGraph(b *testing.B) {
-	const nodeCount = 1_000
-	benchmarks := []struct {
-		name        string
-		definitions []graphDefinition
-	}{
-		{name: "deep-chain", definitions: benchmarkChainDefinitions(nodeCount)},
-		{name: "wide", definitions: benchmarkWideDefinitions(nodeCount)},
+func TestDeepChainUsesIterativeGraphTraversal(t *testing.T) {
+	const depth = 5000
+	ref := component.Value(0)
+	for index := 1; index <= depth; index++ {
+		ref = ref.Map(func(previous int) int { return previous + 1 })
 	}
-
-	for _, benchmark := range benchmarks {
-		b.Run(benchmark.name, func(b *testing.B) {
-			b.ReportAllocs()
-			for b.Loop() {
-				graph, err := compileGraph(benchmark.definitions)
-				if err != nil {
-					b.Fatalf("compileGraph() failed: %v", err)
-				}
-				if len(graph.entries) != nodeCount || len(graph.frontiers) == 0 {
-					b.Fatalf(
-						"compileGraph() returned %d entries and %d frontiers",
-						len(graph.entries),
-						len(graph.frontiers),
-					)
-				}
-			}
-		})
+	rt, err := component.New(ref)
+	if err != nil {
+		t.Fatalf("New returned an error for a deep chain")
+	}
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error for a deep chain")
+	}
+	got, err := rt.Value(ref)
+	if err != nil {
+		t.Fatalf("Value returned an error for a deep chain")
+	}
+	if got != depth {
+		t.Fatalf("deep chain result = %d, want %d", got, depth)
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error for a deep chain")
 	}
 }
 
-func benchmarkChainDefinitions(count int) []graphDefinition {
-	nodes := benchmarkNodeDescriptors(count)
-	definitions := make([]graphDefinition, count)
-	for index, node := range nodes {
-		definitions[index] = graphDefinition{node: node}
-		if index != 0 {
-			definitions[index].dependencies = []nodeDescriptor{nodes[index-1]}
-		}
+func TestDiamondAndWideGraphsDeduplicateSharedDefinitions(t *testing.T) {
+	var created atomic.Int32
+	base := component.Provide(func() *int {
+		created.Add(1)
+		value := 9
+		return &value
+	})
+	left := base.Map(func(value *int) int { return *value + 1 })
+	right := base.Map(func(value *int) int { return *value + 2 })
+	diamond := left.With(right).Map(func(first, second int) int { return first + second })
+
+	const width = 128
+	roots := make([]component.Root, 0, width+1)
+	roots = append(roots, diamond)
+	for index := 0; index < width; index++ {
+		offset := index
+		roots = append(roots, base.Map(func(value *int) int { return *value + offset }))
 	}
-	return definitions
+	rt, err := component.New(roots...)
+	if err != nil {
+		t.Fatalf("New returned an error for a wide graph")
+	}
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error for a wide graph")
+	}
+	if got := created.Load(); got != 1 {
+		t.Fatalf("shared source was constructed %d times, want 1", got)
+	}
+	if got, err := rt.Value(diamond); err != nil || got != 21 {
+		t.Fatalf("diamond result = %d, error present=%t; want 21", got, err != nil)
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error for a wide graph")
+	}
 }
 
-func benchmarkWideDefinitions(count int) []graphDefinition {
-	nodes := benchmarkNodeDescriptors(count)
-	definitions := make([]graphDefinition, count)
-	for index, node := range nodes {
-		definitions[index] = graphDefinition{node: node}
+func TestIndependentSameTypeRefsRemainDistinct(t *testing.T) {
+	first := component.Provide(func() int { return 17 })
+	second := component.Provide(func() int { return 23 })
+	combined := first.With(second).Map(func(a, b int) int { return a*100 + b })
+	rt, err := component.New(combined)
+	if err != nil {
+		t.Fatalf("New returned an error")
 	}
-	return definitions
-}
-
-func benchmarkNodeDescriptors(count int) []nodeDescriptor {
-	descriptors := make([]nodeDescriptor, count)
-	for index := range descriptors {
-		descriptors[index] = descriptor(newTestNode(fmt.Sprintf("node-%05d", index)))
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
 	}
-	return descriptors
-}
-
-func frontierLabels(runtime *Runtime) [][]string {
-	labels := make([][]string, len(runtime.core.frontiers))
-	for frontierIndex, frontier := range runtime.core.frontiers {
-		labels[frontierIndex] = make([]string, len(frontier))
-		for nodeIndex, index := range frontier {
-			labels[frontierIndex][nodeIndex] = runtime.core.entries[index].node.label
-		}
+	got, err := rt.Value(combined)
+	if err != nil {
+		t.Fatalf("Value returned an error")
 	}
-	return labels
-}
-
-func mustRegister(t *testing.T, registry *Registry, node testNode, deps ...NodeRef) {
-	t.Helper()
-	if err := registry.Register(node, noOpLifecycle(), deps...); err != nil {
-		t.Fatalf("Register(%q) failed: %v", node, err)
+	if got != 1723 {
+		t.Fatalf("same-type refs were merged: result=%d, want 1723", got)
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
 	}
 }

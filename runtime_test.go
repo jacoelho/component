@@ -1,1214 +1,882 @@
-package component
+package component_test
 
 import (
 	"context"
 	"errors"
-	"fmt"
-	"reflect"
-	goruntime "runtime"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	component "github.com/jacoelho/component"
 )
 
-type eventLog struct {
-	mu     sync.Mutex
-	events []string
+type runtimeResource struct {
+	name    string
+	startFn func(context.Context) error
+	stopFn  func(context.Context) error
 }
 
-func (log *eventLog) add(event string) {
-	log.mu.Lock()
-	log.events = append(log.events, event)
-	log.mu.Unlock()
-}
-
-func (log *eventLog) snapshot() []string {
-	log.mu.Lock()
-	defer log.mu.Unlock()
-	return append([]string(nil), log.events...)
-}
-
-func recordedLifecycle(log *eventLog, name string) LifecycleFuncs {
-	return LifecycleFuncs{
-		OnConfigure: func(context.Context) error {
-			log.add(name + ".configure")
-			return nil
-		},
-		OnStart: func(context.Context) error {
-			log.add(name + ".start")
-			return nil
-		},
-		OnStop: func(context.Context) error {
-			log.add(name + ".stop")
-			return nil
-		},
-	}
-}
-
-type recordedOwner struct {
-	log  *eventLog
-	name string
-}
-
-func (owner *recordedOwner) Configure(context.Context) error {
-	owner.log.add(owner.name + ".configure")
-	return nil
-}
-
-func (owner *recordedOwner) Start(context.Context) error {
-	owner.log.add(owner.name + ".start")
-	return nil
-}
-
-func (owner *recordedOwner) Stop(context.Context) error {
-	owner.log.add(owner.name + ".stop")
-	return nil
-}
-
-func TestRuntimeOrdersAllConfigureBeforeStartAndStopsInReverse(t *testing.T) {
-	t.Parallel()
-
-	log := &eventLog{}
-	database := NewNode[*recordedOwner]("database")
-	service := NewNode[*recordedOwner]("service")
-	registry := NewRegistry()
-	if err := registry.Register(service, &recordedOwner{log: log, name: "service"}, database); err != nil {
-		t.Fatalf("Register(service) failed: %v", err)
-	}
-	if err := registry.Register(database, &recordedOwner{log: log, name: "database"}); err != nil {
-		t.Fatalf("Register(database) failed: %v", err)
-	}
-	runtime := mustCompile(t, registry)
-
-	if err := runtime.Start(context.Background()); err != nil {
-		t.Fatalf("Start() failed: %v", err)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
-
-	want := []string{
-		"database.configure",
-		"service.configure",
-		"database.start",
-		"service.start",
-		"service.stop",
-		"database.stop",
-	}
-	if got := log.snapshot(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("events = %v, want %v", got, want)
-	}
-}
-
-func TestConfigureRunsFrontierConcurrentlyAndWaitsBeforeAdvancing(t *testing.T) {
-	t.Parallel()
-
-	entered := make(chan string, 2)
-	release := make(chan struct{})
-	dependentEntered := make(chan struct{})
-	rootLifecycle := func(name string) LifecycleFuncs {
-		return LifecycleFuncs{OnConfigure: func(context.Context) error {
-			entered <- name
-			<-release
-			return nil
-		}}
-	}
-
-	first := newTestNode("first")
-	second := newTestNode("second")
-	dependent := newTestNode("dependent")
-	registry := NewRegistry()
-	mustRegisterLifecycle(t, registry, dependent, LifecycleFuncs{
-		OnConfigure: func(context.Context) error {
-			close(dependentEntered)
-			return nil
-		},
-	}, first, second)
-	mustRegisterLifecycle(t, registry, second, rootLifecycle("second"))
-	mustRegisterLifecycle(t, registry, first, rootLifecycle("first"))
-	runtime := mustCompile(t, registry)
-
-	startResult := make(chan error, 1)
-	go func() { startResult <- runtime.Start(context.Background()) }()
-	for range 2 {
-		select {
-		case <-entered:
-		case <-time.After(time.Second):
-			t.Fatal("same-frontier Configure callbacks did not run concurrently")
-		}
-	}
-	select {
-	case <-dependentEntered:
-		t.Fatal("dependent Configure ran before the root frontier completed")
-	default:
-	}
-	close(release)
-	if err := receiveError(t, startResult); err != nil {
-		t.Fatalf("Start() failed: %v", err)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
-}
-
-func TestStartRunsFrontierConcurrentlyAndWaitsBeforeAdvancing(t *testing.T) {
-	t.Parallel()
-
-	entered := make(chan string, 2)
-	release := make(chan struct{})
-	dependentEntered := make(chan struct{})
-	rootLifecycle := func(name string) LifecycleFuncs {
-		return LifecycleFuncs{OnStart: func(context.Context) error {
-			entered <- name
-			<-release
-			return nil
-		}}
-	}
-
-	first := newTestNode("first")
-	second := newTestNode("second")
-	dependent := newTestNode("dependent")
-	registry := NewRegistry()
-	mustRegisterLifecycle(t, registry, dependent, LifecycleFuncs{
-		OnStart: func(context.Context) error {
-			close(dependentEntered)
-			return nil
-		},
-	}, first, second)
-	mustRegisterLifecycle(t, registry, second, rootLifecycle("second"))
-	mustRegisterLifecycle(t, registry, first, rootLifecycle("first"))
-	runtime := mustCompile(t, registry)
-
-	startResult := make(chan error, 1)
-	go func() { startResult <- runtime.Start(context.Background()) }()
-	for range 2 {
-		select {
-		case <-entered:
-		case <-time.After(time.Second):
-			t.Fatal("same-frontier Start callbacks did not run concurrently")
-		}
-	}
-	select {
-	case <-dependentEntered:
-		t.Fatal("dependent Start ran before the root frontier completed")
-	default:
-	}
-	close(release)
-	if err := receiveError(t, startResult); err != nil {
-		t.Fatalf("Start() failed: %v", err)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
-}
-
-func TestConfigureFailureLeavesCleanupForCaller(t *testing.T) {
-	t.Parallel()
-
-	configureErr := errors.New("configure failed")
-	log := &eventLog{}
-	root := newTestNode("root")
-	child := newTestNode("child")
-	registry := NewRegistry()
-	mustRegisterLifecycle(t, registry, root, recordedLifecycle(log, "root"))
-	mustRegisterLifecycle(t, registry, child, LifecycleFuncs{
-		OnConfigure: func(context.Context) error {
-			log.add("child.configure")
-			return configureErr
-		},
-		OnStart: func(context.Context) error {
-			log.add("child.start")
-			return nil
-		},
-		OnStop: func(context.Context) error {
-			log.add("child.stop")
-			return nil
-		},
-	}, root)
-	runtime := mustCompile(t, registry)
-
-	err := runtime.Start(context.Background())
-	if !errors.Is(err, configureErr) {
-		t.Fatalf("Start() error = %v, want configure cause", err)
-	}
-	want := []string{
-		"root.configure",
-		"child.configure",
-	}
-	if got := log.snapshot(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("events = %v, want %v", got, want)
-	}
-	if err := runtime.Start(context.Background()); !errors.Is(err, ErrCleanupPending) {
-		t.Fatalf("Start() before cleanup error = %v, want ErrCleanupPending", err)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
-	want = append(want, "child.stop", "root.stop")
-	if got := log.snapshot(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("events after Stop() = %v, want %v", got, want)
-	}
-	if err := runtime.Start(context.Background()); !errors.Is(err, ErrAlreadyStarted) {
-		t.Fatalf("Start() after cleanup error = %v, want ErrAlreadyStarted", err)
-	}
-}
-
-func TestStopAfterConfigureFailureCleansInvokedSiblingsOnly(t *testing.T) {
-	t.Parallel()
-
-	configureErr := errors.New("configure failed")
-	var successfulConfigures atomic.Int32
-	var failingConfigures atomic.Int32
-	var dependentConfigures atomic.Int32
-	var successfulStops atomic.Int32
-	var failingStops atomic.Int32
-	var dependentStops atomic.Int32
-
-	successful := newTestNode("successful")
-	failing := newTestNode("failing")
-	dependent := newTestNode("dependent")
-	registry := NewRegistry()
-	mustRegisterLifecycle(t, registry, successful, LifecycleFuncs{
-		OnConfigure: func(context.Context) error { successfulConfigures.Add(1); return nil },
-		OnStop:      func(context.Context) error { successfulStops.Add(1); return nil },
-	})
-	mustRegisterLifecycle(t, registry, failing, LifecycleFuncs{
-		OnConfigure: func(context.Context) error { failingConfigures.Add(1); return configureErr },
-		OnStop:      func(context.Context) error { failingStops.Add(1); return nil },
-	})
-	mustRegisterLifecycle(t, registry, dependent, LifecycleFuncs{
-		OnConfigure: func(context.Context) error { dependentConfigures.Add(1); return nil },
-		OnStop:      func(context.Context) error { dependentStops.Add(1); return nil },
-	}, successful, failing)
-	runtime := mustCompile(t, registry)
-
-	if err := runtime.Start(context.Background()); !errors.Is(err, configureErr) {
-		t.Fatalf("Start() error = %v, want configure cause", err)
-	}
-	if got := successfulConfigures.Load(); got != 1 {
-		t.Fatalf("successful Configure count = %d, want 1", got)
-	}
-	if got := failingConfigures.Load(); got != 1 {
-		t.Fatalf("failing Configure count = %d, want 1", got)
-	}
-	if got := dependentConfigures.Load(); got != 0 {
-		t.Fatalf("unvisited dependent Configure count = %d, want 0", got)
-	}
-	if got := successfulStops.Load(); got != 0 {
-		t.Fatalf("successful sibling Stop count before Stop() = %d, want 0", got)
-	}
-	if got := failingStops.Load(); got != 0 {
-		t.Fatalf("failing sibling Stop count before Stop() = %d, want 0", got)
-	}
-	if got := dependentStops.Load(); got != 0 {
-		t.Fatalf("unvisited dependent Stop count before Stop() = %d, want 0", got)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
-	if got := successfulStops.Load(); got != 1 {
-		t.Fatalf("successful sibling Stop count = %d, want 1", got)
-	}
-	if got := failingStops.Load(); got != 1 {
-		t.Fatalf("failing sibling Stop count = %d, want 1", got)
-	}
-	if got := dependentStops.Load(); got != 0 {
-		t.Fatalf("unvisited dependent Stop count = %d, want 0", got)
-	}
-}
-
-func TestStopAfterStartFailureCleansConfiguredNodesNeverStarted(t *testing.T) {
-	t.Parallel()
-
-	startErr := errors.New("start failed")
-	log := &eventLog{}
-	a := newTestNode("a")
-	b := newTestNode("b")
-	c := newTestNode("c")
-	registry := NewRegistry()
-	mustRegisterLifecycle(t, registry, a, recordedLifecycle(log, "a"))
-	bLifecycle := recordedLifecycle(log, "b")
-	bLifecycle.OnStart = func(context.Context) error {
-		log.add("b.start")
-		return startErr
-	}
-	mustRegisterLifecycle(t, registry, b, bLifecycle, a)
-	mustRegisterLifecycle(t, registry, c, recordedLifecycle(log, "c"), b)
-	runtime := mustCompile(t, registry)
-
-	err := runtime.Start(context.Background())
-	if !errors.Is(err, startErr) {
-		t.Fatalf("Start() error = %v, want start cause", err)
-	}
-	want := []string{
-		"a.configure", "b.configure", "c.configure",
-		"a.start", "b.start",
-	}
-	if got := log.snapshot(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("events = %v, want %v", got, want)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
-	want = append(want, "c.stop", "b.stop", "a.stop")
-	if got := log.snapshot(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("events after Stop() = %v, want %v", got, want)
-	}
-}
-
-func TestStopAfterFailedStartUsesCallerContext(t *testing.T) {
-	t.Parallel()
-
-	configureErr := errors.New("configure failed")
-	ctx, cancel := context.WithCancel(context.Background())
-	stopObserved := make(chan error, 1)
-	node := newTestNode("worker")
-	registry := NewRegistry()
-	mustRegisterLifecycle(t, registry, node, LifecycleFuncs{
-		OnConfigure: func(context.Context) error {
-			cancel()
-			return configureErr
-		},
-		OnStop: func(ctx context.Context) error {
-			_, hasDeadline := ctx.Deadline()
-			if !hasDeadline {
-				return errors.New("stop context has no deadline")
-			}
-			stopObserved <- ctx.Err()
-			return nil
-		},
-	})
-	runtime := mustCompile(t, registry)
-
-	err := runtime.Start(ctx)
-	if !errors.Is(err, configureErr) {
-		t.Fatalf("Start() error = %v, want configure cause", err)
-	}
-	select {
-	case got := <-stopObserved:
-		t.Fatalf("Start() invoked Stop with context error %v", got)
-	default:
-	}
-	stopCtx, cancelStop := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
-	defer cancelStop()
-	if err := runtime.Stop(stopCtx); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
-	if got := receiveError(t, stopObserved); got != nil {
-		t.Fatalf("Stop() context error = %v, want nil", got)
-	}
-}
-
-func TestStopTimeoutAfterFailedStartRetainsCleanupForRetry(t *testing.T) {
-	t.Parallel()
-
-	configureErr := errors.New("configure failed")
-	var stops atomic.Int32
-	node := newTestNode("worker")
-	registry := NewRegistry()
-	mustRegisterLifecycle(t, registry, node, LifecycleFuncs{
-		OnConfigure: func(context.Context) error { return configureErr },
-		OnStop: func(ctx context.Context) error {
-			if stops.Add(1) == 1 {
-				<-ctx.Done()
-				return ctx.Err()
-			}
-			return nil
-		},
-	})
-	runtime := mustCompile(t, registry)
-
-	err := runtime.Start(context.Background())
-	if !errors.Is(err, configureErr) {
-		t.Fatalf("Start() error = %v, want configure cause", err)
-	}
-	if got := stops.Load(); got != 0 {
-		t.Fatalf("Stop call count before Stop() = %d, want 0", got)
-	}
-	stopCtx, cancelStop := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancelStop()
-	if err := runtime.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Stop() error = %v, want context.DeadlineExceeded", err)
-	}
-	if err := runtime.Start(context.Background()); !errors.Is(err, ErrCleanupPending) {
-		t.Fatalf("Start() with timed-out cleanup error = %v, want ErrCleanupPending", err)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("retry Stop() failed: %v", err)
-	}
-	if err := runtime.Start(context.Background()); !errors.Is(err, ErrAlreadyStarted) {
-		t.Fatalf("Start() after completed retry error = %v, want ErrAlreadyStarted", err)
-	}
-}
-
-func TestStopFailureBlocksOnlyItsDependencyAndCanBeRetried(t *testing.T) {
-	t.Parallel()
-
-	stopErr := errors.New("leaf-a stop failed")
-	var dependencyAStops atomic.Int32
-	var leafAStops atomic.Int32
-	var dependencyBStops atomic.Int32
-	var leafBStops atomic.Int32
-
-	dependencyA := newTestNode("dependency-a")
-	leafA := newTestNode("leaf-a")
-	dependencyB := newTestNode("dependency-b")
-	leafB := newTestNode("leaf-b")
-	registry := NewRegistry()
-	mustRegisterLifecycle(t, registry, dependencyA, LifecycleFuncs{
-		OnStop: func(context.Context) error { dependencyAStops.Add(1); return nil },
-	})
-	mustRegisterLifecycle(t, registry, leafA, LifecycleFuncs{
-		OnStop: func(context.Context) error {
-			if leafAStops.Add(1) == 1 {
-				return stopErr
-			}
-			return nil
-		},
-	}, dependencyA)
-	mustRegisterLifecycle(t, registry, dependencyB, LifecycleFuncs{
-		OnStop: func(context.Context) error { dependencyBStops.Add(1); return nil },
-	})
-	mustRegisterLifecycle(t, registry, leafB, LifecycleFuncs{
-		OnStop: func(context.Context) error { leafBStops.Add(1); return nil },
-	}, dependencyB)
-	runtime := mustCompile(t, registry)
-	if err := runtime.Start(context.Background()); err != nil {
-		t.Fatalf("Start() failed: %v", err)
-	}
-
-	if err := runtime.Stop(context.Background()); !errors.Is(err, stopErr) {
-		t.Fatalf("first Stop() error = %v, want leaf failure", err)
-	}
-	if got := dependencyAStops.Load(); got != 0 {
-		t.Fatalf("blocked dependency-a Stop count = %d, want 0", got)
-	}
-	if got := dependencyBStops.Load(); got != 1 {
-		t.Fatalf("unrelated dependency-b Stop count = %d, want 1", got)
-	}
-	if err := runtime.Start(context.Background()); !errors.Is(err, ErrCleanupPending) {
-		t.Fatalf("Start() with pending cleanup error = %v, want ErrCleanupPending", err)
-	}
-
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("retry Stop() failed: %v", err)
-	}
-	if got := leafAStops.Load(); got != 2 {
-		t.Fatalf("leaf-a Stop count = %d, want 2", got)
-	}
-	if got := dependencyAStops.Load(); got != 1 {
-		t.Fatalf("dependency-a Stop count = %d, want 1", got)
-	}
-	if got := leafBStops.Load(); got != 1 {
-		t.Fatalf("leaf-b was stopped again: count = %d", got)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("idempotent Stop() failed: %v", err)
-	}
-}
-
-func TestStopFailureBlocksSharedDependencyUntilEveryDependentStops(t *testing.T) {
-	t.Parallel()
-
-	stopErr := errors.New("alpha stop failed")
-	var alphaStops atomic.Int32
-	var zetaStops atomic.Int32
-	var sharedStops atomic.Int32
-	shared := newTestNode("shared")
-	alpha := newTestNode("alpha")
-	zeta := newTestNode("zeta")
-	registry := NewRegistry()
-	mustRegisterLifecycle(t, registry, shared, LifecycleFuncs{
-		OnStop: func(context.Context) error { sharedStops.Add(1); return nil },
-	})
-	mustRegisterLifecycle(t, registry, alpha, LifecycleFuncs{
-		OnStop: func(context.Context) error {
-			if alphaStops.Add(1) == 1 {
-				return stopErr
-			}
-			return nil
-		},
-	}, shared)
-	mustRegisterLifecycle(t, registry, zeta, LifecycleFuncs{
-		OnStop: func(context.Context) error { zetaStops.Add(1); return nil },
-	}, shared)
-	runtime := mustCompile(t, registry)
-	if err := runtime.Start(context.Background()); err != nil {
-		t.Fatalf("Start() failed: %v", err)
-	}
-
-	if err := runtime.Stop(context.Background()); !errors.Is(err, stopErr) {
-		t.Fatalf("first Stop() error = %v, want alpha failure", err)
-	}
-	if got := sharedStops.Load(); got != 0 {
-		t.Fatalf("shared dependency Stop count = %d, want 0", got)
-	}
-	if got := zetaStops.Load(); got != 1 {
-		t.Fatalf("successful dependent Stop count = %d, want 1", got)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("retry Stop() failed: %v", err)
-	}
-	if got := sharedStops.Load(); got != 1 {
-		t.Fatalf("shared dependency Stop count after retry = %d, want 1", got)
-	}
-	if got := zetaStops.Load(); got != 1 {
-		t.Fatalf("successful dependent was retried: count = %d", got)
-	}
-}
-
-func TestStopAdvancesSuccessfulBranchWhileUnrelatedCallbackRuns(t *testing.T) {
-	t.Parallel()
-
-	slowEntered := make(chan struct{})
-	releaseSlow := make(chan struct{})
-	fastDependencyStopped := make(chan struct{})
-	fastDependency := newTestNode("fast-dependency")
-	fastLeaf := newTestNode("fast-leaf")
-	slowLeaf := newTestNode("slow-leaf")
-	registry := NewRegistry()
-	mustRegisterLifecycle(t, registry, fastDependency, LifecycleFuncs{
-		OnStop: func(context.Context) error {
-			close(fastDependencyStopped)
-			return nil
-		},
-	})
-	mustRegisterLifecycle(t, registry, fastLeaf, LifecycleFuncs{}, fastDependency)
-	mustRegisterLifecycle(t, registry, slowLeaf, LifecycleFuncs{
-		OnStop: func(context.Context) error {
-			close(slowEntered)
-			<-releaseSlow
-			return nil
-		},
-	})
-	runtime := mustCompile(t, registry)
-	if err := runtime.Start(context.Background()); err != nil {
-		t.Fatalf("Start() failed: %v", err)
-	}
-
-	stopResult := make(chan error, 1)
-	go func() { stopResult <- runtime.Stop(context.Background()) }()
-	select {
-	case <-slowEntered:
-	case <-time.After(time.Second):
-		t.Fatal("slow Stop callback did not start")
-	}
-	select {
-	case <-fastDependencyStopped:
-		// The successful branch advanced without waiting for slowLeaf.
-	case <-time.After(time.Second):
-		t.Fatal("fast dependency did not stop while unrelated callback was running")
-	}
-	close(releaseSlow)
-	if err := receiveError(t, stopResult); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
-}
-
-func TestLifecycleErrorsAreAggregatedDeterministically(t *testing.T) {
-	t.Parallel()
-
-	alphaErr := errors.New("alpha failure")
-	zetaErr := errors.New("zeta failure")
-	registry := NewRegistry()
-	mustRegisterLifecycle(t, registry, newTestNode("zeta"), LifecycleFuncs{
-		OnStop: func(context.Context) error { return zetaErr },
-	})
-	mustRegisterLifecycle(t, registry, newTestNode("alpha"), LifecycleFuncs{
-		OnStop: func(context.Context) error { return alphaErr },
-	})
-	runtime := mustCompile(t, registry)
-	if err := runtime.Start(context.Background()); err != nil {
-		t.Fatalf("Start() failed: %v", err)
-	}
-
-	err := runtime.Stop(context.Background())
-	if !errors.Is(err, alphaErr) || !errors.Is(err, zetaErr) {
-		t.Fatalf("Stop() error = %v, want both causes", err)
-	}
-	alphaPosition := strings.Index(err.Error(), alphaErr.Error())
-	zetaPosition := strings.Index(err.Error(), zetaErr.Error())
-	if alphaPosition < 0 || zetaPosition < 0 || alphaPosition >= zetaPosition {
-		t.Fatalf("Stop() error order is not alpha then zeta: %q", err)
-	}
-}
-
-func TestConfigureAggregatesConcurrentFailuresDeterministically(t *testing.T) {
-	t.Parallel()
-
-	alphaErr := errors.New("alpha configure failure")
-	zetaErr := errors.New("zeta configure failure")
-	registry := NewRegistry()
-	mustRegisterLifecycle(t, registry, newTestNode("zeta"), LifecycleFuncs{
-		OnConfigure: func(context.Context) error { return zetaErr },
-	})
-	mustRegisterLifecycle(t, registry, newTestNode("alpha"), LifecycleFuncs{
-		OnConfigure: func(context.Context) error { return alphaErr },
-	})
-	runtime := mustCompile(t, registry)
-
-	err := runtime.Start(context.Background())
-	if !errors.Is(err, alphaErr) || !errors.Is(err, zetaErr) {
-		t.Fatalf("Start() error = %v, want both configure causes", err)
-	}
-	alphaPosition := strings.Index(err.Error(), alphaErr.Error())
-	zetaPosition := strings.Index(err.Error(), zetaErr.Error())
-	if alphaPosition < 0 || zetaPosition < 0 || alphaPosition >= zetaPosition {
-		t.Fatalf("Start() error order is not alpha then zeta: %q", err)
-	}
-}
-
-func TestStopFailureAfterFailedStartRetainsCleanupForRetry(t *testing.T) {
-	t.Parallel()
-
-	configureErr := errors.New("configure failure")
-	stopErr := errors.New("stop failure")
-	var stops atomic.Int32
-	runtime := runtimeWithOneNode(t, LifecycleFuncs{
-		OnConfigure: func(context.Context) error { return configureErr },
-		OnStop: func(context.Context) error {
-			if stops.Add(1) == 1 {
-				return stopErr
-			}
-			return nil
-		},
-	})
-
-	err := runtime.Start(context.Background())
-	if !errors.Is(err, configureErr) {
-		t.Fatalf("Start() error = %v, want configure cause", err)
-	}
-	if got := stops.Load(); got != 0 {
-		t.Fatalf("Stop call count before Stop() = %d, want 0", got)
-	}
-	if err := runtime.Stop(context.Background()); !errors.Is(err, stopErr) {
-		t.Fatalf("first Stop() error = %v, want stop cause", err)
-	}
-	if err := runtime.Start(context.Background()); !errors.Is(err, ErrCleanupPending) {
-		t.Fatalf("Start() with retained cleanup error = %v, want ErrCleanupPending", err)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("retry Stop() failed: %v", err)
-	}
-	if got := stops.Load(); got != 2 {
-		t.Fatalf("Stop call count = %d, want 2", got)
-	}
-	if err := runtime.Start(context.Background()); !errors.Is(err, ErrAlreadyStarted) {
-		t.Fatalf("Start() after completed cleanup error = %v, want ErrAlreadyStarted", err)
-	}
-}
-
-func TestRuntimeIsOneShot(t *testing.T) {
-	t.Parallel()
-
-	t.Run("after successful start", func(t *testing.T) {
-		t.Parallel()
-
-		var configureCalls atomic.Int32
-		var startCalls atomic.Int32
-		var stopCalls atomic.Int32
-		runtime := runtimeWithOneNode(t, LifecycleFuncs{
-			OnConfigure: func(context.Context) error {
-				configureCalls.Add(1)
-				return nil
-			},
-			OnStart: func(context.Context) error {
-				startCalls.Add(1)
-				return nil
-			},
-			OnStop: func(context.Context) error {
-				stopCalls.Add(1)
-				return nil
-			},
-		})
-		if err := runtime.Start(context.Background()); err != nil {
-			t.Fatalf("Start() failed: %v", err)
-		}
-		if err := runtime.Start(context.Background()); !errors.Is(err, ErrAlreadyStarted) {
-			t.Fatalf("second Start() error = %v, want ErrAlreadyStarted", err)
-		}
-		if err := runtime.Stop(context.Background()); err != nil {
-			t.Fatalf("Stop() failed: %v", err)
-		}
-		if err := runtime.Start(context.Background()); !errors.Is(err, ErrAlreadyStarted) {
-			t.Fatalf("Start() after Stop() error = %v, want ErrAlreadyStarted", err)
-		}
-		if got := configureCalls.Load(); got != 1 {
-			t.Fatalf("Configure call count = %d, want 1", got)
-		}
-		if got := startCalls.Load(); got != 1 {
-			t.Fatalf("Start call count = %d, want 1", got)
-		}
-		if got := stopCalls.Load(); got != 1 {
-			t.Fatalf("Stop call count = %d, want 1", got)
-		}
-	})
-
-	t.Run("after stop before start", func(t *testing.T) {
-		t.Parallel()
-
-		var stopCalls atomic.Int32
-		runtime := runtimeWithOneNode(t, LifecycleFuncs{
-			OnStop: func(context.Context) error { stopCalls.Add(1); return nil },
-		})
-		if err := runtime.Stop(context.Background()); err != nil {
-			t.Fatalf("Stop() failed: %v", err)
-		}
-		if got := stopCalls.Load(); got != 0 {
-			t.Fatalf("Stop before Start invoked callbacks %d times", got)
-		}
-		if err := runtime.Start(context.Background()); !errors.Is(err, ErrAlreadyStarted) {
-			t.Fatalf("Start() after Stop() error = %v, want ErrAlreadyStarted", err)
-		}
-	})
-}
-
-func TestCopiedRuntimeSharesOneShotState(t *testing.T) {
-	t.Parallel()
-
-	var starts atomic.Int32
-	runtime := runtimeWithOneNode(t, LifecycleFuncs{
-		OnStart: func(context.Context) error { starts.Add(1); return nil },
-	})
-	copied := *runtime
-	if err := copied.Start(context.Background()); err != nil {
-		t.Fatalf("Start() through copy failed: %v", err)
-	}
-	if err := runtime.Start(context.Background()); !errors.Is(err, ErrAlreadyStarted) {
-		t.Fatalf("Start() through original error = %v, want ErrAlreadyStarted", err)
-	}
-	if got := starts.Load(); got != 1 {
-		t.Fatalf("Start callback count = %d, want 1", got)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() through original failed: %v", err)
-	}
-	if err := copied.Stop(context.Background()); err != nil {
-		t.Fatalf("idempotent Stop() through copy failed: %v", err)
-	}
-}
-
-func TestZeroRuntimeIsInvalid(t *testing.T) {
-	t.Parallel()
-
-	var runtime Runtime
-	if err := runtime.Start(context.Background()); err == nil {
-		t.Fatal("zero Runtime Start() succeeded")
-	}
-	if err := runtime.Stop(context.Background()); err == nil {
-		t.Fatal("zero Runtime Stop() succeeded")
-	}
-}
-
-func TestRuntimeRejectsOverlappingOperations(t *testing.T) {
-	t.Parallel()
-
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	runtime := runtimeWithOneNode(t, LifecycleFuncs{
-		OnConfigure: func(context.Context) error {
-			close(entered)
-			<-release
-			return nil
-		},
-	})
-	startResult := make(chan error, 1)
-	go func() { startResult <- runtime.Start(context.Background()) }()
-	select {
-	case <-entered:
-	case <-time.After(time.Second):
-		t.Fatal("Configure did not start")
-	}
-	if err := runtime.Start(context.Background()); !errors.Is(err, ErrRuntimeBusy) {
-		t.Fatalf("overlapping Start() error = %v, want ErrRuntimeBusy", err)
-	}
-	if err := runtime.Stop(context.Background()); !errors.Is(err, ErrRuntimeBusy) {
-		t.Fatalf("overlapping Stop() error = %v, want ErrRuntimeBusy", err)
-	}
-	close(release)
-	if err := receiveError(t, startResult); err != nil {
-		t.Fatalf("original Start() failed: %v", err)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("final Stop() failed: %v", err)
-	}
-}
-
-func TestStopRunsEligibleNodesConcurrentlyAndRejectsOverlap(t *testing.T) {
-	t.Parallel()
-
-	entered := make(chan struct{}, 2)
-	release := make(chan struct{})
-	stopLifecycle := func() LifecycleFuncs {
-		return LifecycleFuncs{OnStop: func(context.Context) error {
-			entered <- struct{}{}
-			<-release
-			return nil
-		}}
-	}
-	registry := NewRegistry()
-	mustRegisterLifecycle(t, registry, newTestNode("alpha"), stopLifecycle())
-	mustRegisterLifecycle(t, registry, newTestNode("zeta"), stopLifecycle())
-	runtime := mustCompile(t, registry)
-	if err := runtime.Start(context.Background()); err != nil {
-		t.Fatalf("Start() failed: %v", err)
-	}
-
-	stopResult := make(chan error, 1)
-	go func() { stopResult <- runtime.Stop(context.Background()) }()
-	for range 2 {
-		select {
-		case <-entered:
-		case <-time.After(time.Second):
-			t.Fatal("eligible Stop callbacks did not run concurrently")
-		}
-	}
-	if err := runtime.Stop(context.Background()); !errors.Is(err, ErrRuntimeBusy) {
-		t.Fatalf("overlapping Stop() error = %v, want ErrRuntimeBusy", err)
-	}
-	if err := runtime.Start(context.Background()); !errors.Is(err, ErrRuntimeBusy) {
-		t.Fatalf("Start() during Stop() error = %v, want ErrRuntimeBusy", err)
-	}
-	close(release)
-	if err := receiveError(t, stopResult); err != nil {
-		t.Fatalf("original Stop() failed: %v", err)
-	}
-}
-
-func TestRuntimeWaitsForCallbackAfterContextCancellation(t *testing.T) {
-	t.Parallel()
-
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	var stops atomic.Int32
-	runtime := runtimeWithOneNode(t, LifecycleFuncs{
-		OnStart: func(context.Context) error {
-			close(entered)
-			<-release
-			return nil
-		},
-		OnStop: func(context.Context) error { stops.Add(1); return nil },
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- runtime.Start(ctx) }()
-	<-entered
-	cancel()
-	select {
-	case err := <-result:
-		t.Fatalf("Start() returned before its callback completed: %v", err)
-	default:
-	}
-	close(release)
-	err := receiveError(t, result)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Start() error = %v, want context.Canceled", err)
-	}
-	if got := stops.Load(); got != 0 {
-		t.Fatalf("Stop count before Stop() = %d, want 0", got)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
-	if got := stops.Load(); got != 1 {
-		t.Fatalf("Stop count = %d, want 1", got)
-	}
-}
-
-func TestStopAfterConfigureCancellationUsesCallerContext(t *testing.T) {
-	t.Parallel()
-
-	entered := make(chan struct{})
-	stopContextErr := make(chan error, 1)
-	runtime := runtimeWithOneNode(t, LifecycleFuncs{
-		OnConfigure: func(ctx context.Context) error {
-			close(entered)
-			<-ctx.Done()
-			return ctx.Err()
-		},
-		OnStop: func(ctx context.Context) error {
-			stopContextErr <- ctx.Err()
-			return nil
-		},
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() { result <- runtime.Start(ctx) }()
-	<-entered
-	cancel()
-	err := receiveError(t, result)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Start() error = %v, want context.Canceled", err)
-	}
-	select {
-	case got := <-stopContextErr:
-		t.Fatalf("Start() invoked Stop with context error %v", got)
-	default:
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
-	if got := receiveError(t, stopContextErr); got != nil {
-		t.Fatalf("Stop() context error = %v, want nil", got)
-	}
-}
-
-func TestCancelledStopRetainsNodeForRetry(t *testing.T) {
-	t.Parallel()
-
-	var stops atomic.Int32
-	runtime := runtimeWithOneNode(t, LifecycleFuncs{
-		OnStop: func(ctx context.Context) error {
-			stops.Add(1)
-			return ctx.Err()
-		},
-	})
-	if err := runtime.Start(context.Background()); err != nil {
-		t.Fatalf("Start() failed: %v", err)
-	}
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := runtime.Stop(cancelled); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Stop(cancelled) error = %v, want context.Canceled", err)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("retry Stop() failed: %v", err)
-	}
-	if got := stops.Load(); got != 2 {
-		t.Fatalf("Stop call count = %d, want 2", got)
-	}
-}
-
-func TestLifecyclePanicsAreCapturedWithCauseAndStack(t *testing.T) {
-	t.Parallel()
-
-	panicCause := errors.New("broken callback")
-	var stops atomic.Int32
-	runtime := runtimeWithOneNode(t, LifecycleFuncs{
-		OnConfigure: func(context.Context) error { panic(panicCause) },
-		OnStop:      func(context.Context) error { stops.Add(1); return nil },
-	})
-	err := runtime.Start(context.Background())
-	if !errors.Is(err, ErrPanic) || !errors.Is(err, panicCause) {
-		t.Fatalf("Start() error = %v, want ErrPanic and panic cause", err)
-	}
-	if !strings.Contains(err.Error(), "phase configure") ||
-		!strings.Contains(err.Error(), "goroutine") {
-		t.Fatalf("panic error lacks phase or stack: %q", err)
-	}
-	if got := stops.Load(); got != 0 {
-		t.Fatalf("Stop count before Stop() = %d, want 0", got)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
-	if got := stops.Load(); got != 1 {
-		t.Fatalf("Stop count = %d, want 1", got)
-	}
-}
-
-func TestStartPanicLeavesConfiguredGraphForCallerCleanup(t *testing.T) {
-	t.Parallel()
-
-	panicCause := errors.New("start panic")
-	var stops atomic.Int32
-	runtime := runtimeWithOneNode(t, LifecycleFuncs{
-		OnStart: func(context.Context) error { panic(panicCause) },
-		OnStop:  func(context.Context) error { stops.Add(1); return nil },
-	})
-	err := runtime.Start(context.Background())
-	if !errors.Is(err, ErrPanic) || !errors.Is(err, panicCause) {
-		t.Fatalf("Start() error = %v, want ErrPanic and panic cause", err)
-	}
-	if !strings.Contains(err.Error(), "phase start") {
-		t.Fatalf("panic error lacks start phase: %q", err)
-	}
-	if got := stops.Load(); got != 0 {
-		t.Fatalf("Stop count before Stop() = %d, want 0", got)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
-	if got := stops.Load(); got != 1 {
-		t.Fatalf("Stop count = %d, want 1", got)
-	}
-}
-
-func TestStopPanicRetainsCleanupForRetry(t *testing.T) {
-	t.Parallel()
-
-	panicCause := errors.New("stop panic")
-	var stops atomic.Int32
-	runtime := runtimeWithOneNode(t, LifecycleFuncs{
-		OnStop: func(context.Context) error {
-			if stops.Add(1) == 1 {
-				panic(panicCause)
-			}
-			return nil
-		},
-	})
-	if err := runtime.Start(context.Background()); err != nil {
-		t.Fatalf("Start() failed: %v", err)
-	}
-	err := runtime.Stop(context.Background())
-	if !errors.Is(err, ErrPanic) || !errors.Is(err, panicCause) {
-		t.Fatalf("Stop() error = %v, want ErrPanic and panic cause", err)
-	}
-	if !strings.Contains(err.Error(), "phase stop") {
-		t.Fatalf("panic error lacks stop phase: %q", err)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("retry Stop() failed: %v", err)
-	}
-}
-
-func TestLifecycleGoexitIsCapturedAndCleanupIsRetryable(t *testing.T) {
-	t.Parallel()
-
-	var stopCalls atomic.Int32
-	runtime := runtimeWithOneNode(t, LifecycleFuncs{
-		OnStop: func(context.Context) error {
-			if stopCalls.Add(1) == 1 {
-				goruntime.Goexit()
-			}
-			return nil
-		},
-	})
-	if err := runtime.Start(context.Background()); err != nil {
-		t.Fatalf("Start() failed: %v", err)
-	}
-	if err := runtime.Stop(context.Background()); !errors.Is(err, ErrLifecycleAborted) {
-		t.Fatalf("first Stop() error = %v, want ErrLifecycleAborted", err)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("retry Stop() failed: %v", err)
-	}
-	if got := stopCalls.Load(); got != 2 {
-		t.Fatalf("Stop call count = %d, want 2", got)
-	}
-}
-
-func TestStartGoexitLeavesConfiguredGraphForCallerCleanup(t *testing.T) {
-	t.Parallel()
-
-	var stops atomic.Int32
-	runtime := runtimeWithOneNode(t, LifecycleFuncs{
-		OnStart: func(context.Context) error {
-			goruntime.Goexit()
-			return nil
-		},
-		OnStop: func(context.Context) error { stops.Add(1); return nil },
-	})
-	err := runtime.Start(context.Background())
-	if !errors.Is(err, ErrLifecycleAborted) {
-		t.Fatalf("Start() error = %v, want ErrLifecycleAborted", err)
-	}
-	if got := stops.Load(); got != 0 {
-		t.Fatalf("Stop count before Stop() = %d, want 0", got)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
-	if got := stops.Load(); got != 1 {
-		t.Fatalf("Stop count = %d, want 1", got)
-	}
-}
-
-func TestConfigureGoexitLeavesInvokedNodeForCallerCleanup(t *testing.T) {
-	t.Parallel()
-
-	var stops atomic.Int32
-	runtime := runtimeWithOneNode(t, LifecycleFuncs{
-		OnConfigure: func(context.Context) error {
-			goruntime.Goexit()
-			return nil
-		},
-		OnStop: func(context.Context) error { stops.Add(1); return nil },
-	})
-	err := runtime.Start(context.Background())
-	if !errors.Is(err, ErrLifecycleAborted) {
-		t.Fatalf("Start() error = %v, want ErrLifecycleAborted", err)
-	}
-	if got := stops.Load(); got != 0 {
-		t.Fatalf("Stop count before Stop() = %d, want 0", got)
-	}
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
-	if got := stops.Load(); got != 1 {
-		t.Fatalf("Stop count = %d, want 1", got)
-	}
-}
-
-func TestStopHandlesDeepCleanupGraphIteratively(t *testing.T) {
-	if testing.Short() {
-		t.Skip("deep graph")
-	}
-
-	const nodeCount = 10_000
-	registry := NewRegistry()
-	var previous testNode
-	for index := range nodeCount {
-		node := newTestNode(fmt.Sprintf("cleanup-%05d", index))
-		if index == 0 {
-			mustRegisterLifecycle(t, registry, node, LifecycleFuncs{})
-		} else {
-			mustRegisterLifecycle(t, registry, node, LifecycleFuncs{}, previous)
-		}
-		previous = node
-	}
-	runtime := mustCompile(t, registry)
-
-	// Isolate the cleanup scheduler from 20,000 no-op Configure/Start calls.
-	runtime.core.mu.Lock()
-	for index := range runtime.core.cleanup {
-		runtime.core.cleanup[index] = true
-	}
-	runtime.core.state = runtimeRunning
-	runtime.core.mu.Unlock()
-	if err := runtime.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop() failed: %v", err)
-	}
-}
-
-func mustCompile(t *testing.T, registry *Registry) *Runtime {
-	t.Helper()
-	runtime, err := registry.Compile()
-	if err != nil {
-		t.Fatalf("Compile() failed: %v", err)
-	}
-	return runtime
-}
-
-func mustRegisterLifecycle(
-	t *testing.T,
-	registry *Registry,
-	node testNode,
-	lifecycle Lifecycle,
-	dependencies ...NodeRef,
-) {
-	t.Helper()
-	if err := registry.Register(node, lifecycle, dependencies...); err != nil {
-		t.Fatalf("Register(%q) failed: %v", node, err)
-	}
-}
-
-func runtimeWithOneNode(t *testing.T, lifecycle Lifecycle) *Runtime {
-	t.Helper()
-	registry := NewRegistry()
-	mustRegisterLifecycle(t, registry, newTestNode("worker"), lifecycle)
-	return mustCompile(t, registry)
-}
-
-func receiveError(t *testing.T, result <-chan error) error {
-	t.Helper()
-	select {
-	case err := <-result:
-		return err
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for lifecycle operation")
+func (r *runtimeResource) Start(ctx context.Context) error {
+	if r.startFn == nil {
 		return nil
 	}
+	return r.startFn(ctx)
+}
+
+func (r *runtimeResource) Stop(ctx context.Context) error {
+	if r.stopFn == nil {
+		return nil
+	}
+	return r.stopFn(ctx)
+}
+
+type exactContext struct {
+	context.Context
+}
+
+func waitSignal(t *testing.T, signal <-chan struct{}, message string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(5 * time.Second):
+		t.Fatal(message)
+	}
+}
+
+func waitResult(t *testing.T, results <-chan error, message string) error {
+	t.Helper()
+	select {
+	case err := <-results:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal(message)
+		return nil
+	}
+}
+
+func makeRelease(t *testing.T) (chan struct{}, func()) {
+	t.Helper()
+	release := make(chan struct{})
+	var once sync.Once
+	closeRelease := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(closeRelease)
+	return release, closeRelease
+}
+
+func nodeError(t *testing.T, err error) *component.NodeError {
+	t.Helper()
+	var result *component.NodeError
+	if !errors.As(err, &result) {
+		t.Fatalf("error did not expose a NodeError")
+	}
+	return result
+}
+
+func TestManagedChainStartsInDependencyOrderAndStopsInReverse(t *testing.T) {
+	var mu sync.Mutex
+	var events []string
+	record := func(event string) {
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+	}
+	dependency := component.Provide(func() *runtimeResource {
+		record("dependency.construct")
+		return &runtimeResource{
+			name: "dependency",
+			startFn: func(context.Context) error {
+				record("dependency.start")
+				return nil
+			},
+			stopFn: func(context.Context) error {
+				record("dependency.stop")
+				return nil
+			},
+		}
+	}, component.Managed[*runtimeResource]())
+	dependent := dependency.Map(func(dep *runtimeResource) *runtimeResource {
+		record("dependent.construct")
+		return &runtimeResource{
+			name: dep.name + ".child",
+			startFn: func(context.Context) error {
+				record("dependent.start")
+				return nil
+			},
+			stopFn: func(context.Context) error {
+				record("dependent.stop")
+				return nil
+			},
+		}
+	}, component.Managed[*runtimeResource]())
+
+	rt := newTestRuntime(t, dependent)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
+	}
+	mu.Lock()
+	got := append([]string(nil), events...)
+	mu.Unlock()
+	want := []string{
+		"dependency.construct",
+		"dependency.start",
+		"dependent.construct",
+		"dependent.start",
+		"dependent.stop",
+		"dependency.stop",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("events = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestIndependentNodesStartSeriallyAndStopInReverse(t *testing.T) {
+	var mu sync.Mutex
+	var events []string
+	record := func(event string) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, event)
+	}
+	resource := func(name string) component.Ref[*runtimeResource] {
+		return component.Provide(func() *runtimeResource {
+			record(name + ".construct")
+			return &runtimeResource{
+				startFn: func(context.Context) error { record(name + ".start"); return nil },
+				stopFn:  func(context.Context) error { record(name + ".stop"); return nil },
+			}
+		}, component.Managed[*runtimeResource]())
+	}
+	rt := newTestRuntime(t, resource("a"), resource("b"))
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(events, ","), "a.construct,a.start,b.construct,b.start,b.stop,a.stop"; got != want {
+		t.Fatalf("lifecycle order = %s, want %s", got, want)
+	}
+}
+
+func TestFailedStartRetainsSuccessfulOwnershipForCallerStop(t *testing.T) {
+	startFailure := errors.New("sibling construction failed")
+	var sourceStops, laterCalls atomic.Int32
+	source := component.Provide(func() *runtimeResource {
+		return &runtimeResource{name: "source", stopFn: func(context.Context) error {
+			sourceStops.Add(1)
+			return nil
+		}}
+	}, component.Managed[*runtimeResource]())
+	failing := component.TryProvide(func() (*runtimeResource, error) {
+		return nil, startFailure
+	})
+	later := component.Provide(func() int {
+		laterCalls.Add(1)
+		return 1
+	})
+	rt := newTestRuntime(t, source, failing, later)
+	if err := rt.Start(context.Background()); err == nil || !errors.Is(err, startFailure) {
+		t.Fatalf("Start did not return the constructor failure")
+	}
+	if got := sourceStops.Load(); got != 0 {
+		t.Fatalf("Start performed implicit cleanup: stop calls=%d", got)
+	}
+	if got := laterCalls.Load(); got != 0 {
+		t.Fatalf("Start continued after failure: later factory calls=%d", got)
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("caller Stop returned an error")
+	}
+	if got := sourceStops.Load(); got != 1 {
+		t.Fatalf("source stop calls=%d, want 1", got)
+	}
+}
+
+func TestStartHookFailureTransfersOwnershipBeforeCallingTheHook(t *testing.T) {
+	startFailure := errors.New("start hook failed")
+	var starts, stops atomic.Int32
+	ref := component.Provide(func() *runtimeResource {
+		return &runtimeResource{
+			name: "owned",
+			startFn: func(context.Context) error {
+				starts.Add(1)
+				return startFailure
+			},
+			stopFn: func(context.Context) error {
+				stops.Add(1)
+				return nil
+			},
+		}
+	}, component.Managed[*runtimeResource]())
+	rt := newTestRuntime(t, ref)
+	if err := rt.Start(context.Background()); err == nil || !errors.Is(err, startFailure) {
+		t.Fatalf("Start did not return the hook failure")
+	}
+	if starts.Load() != 1 || stops.Load() != 0 {
+		t.Fatalf("unexpected hook counts before Stop: starts=%d stops=%d", starts.Load(), stops.Load())
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop after failed Start returned an error: %v", err)
+	}
+	if got := stops.Load(); got != 1 {
+		t.Fatalf("Stop after failed Start called cleanup %d times, want 1", got)
+	}
+}
+
+func TestConstructorValueAndErrorDoesNotTransferOwnership(t *testing.T) {
+	constructionFailure := errors.New("constructor failed after a value")
+	var starts, stops atomic.Int32
+	ref := component.TryProvide(func() (*runtimeResource, error) {
+		return &runtimeResource{
+			name: "discarded",
+			startFn: func(context.Context) error {
+				starts.Add(1)
+				return nil
+			},
+			stopFn: func(context.Context) error {
+				stops.Add(1)
+				return nil
+			},
+		}, constructionFailure
+	}, component.Managed[*runtimeResource]())
+	rt := newTestRuntime(t, ref)
+	if err := rt.Start(context.Background()); err == nil || !errors.Is(err, constructionFailure) {
+		t.Fatalf("Start did not return the constructor failure")
+	}
+	if starts.Load() != 0 || stops.Load() != 0 {
+		t.Fatalf("hooks ran for a failed constructor: starts=%d stops=%d", starts.Load(), stops.Load())
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
+	}
+}
+
+func TestStartPanicPreservesConstructedOwnershipAndStack(t *testing.T) {
+	var stops atomic.Int32
+	ref := component.Provide(func() *runtimeResource {
+		return &runtimeResource{
+			name: "panic-owner",
+			startFn: func(context.Context) error {
+				panic("start panic payload")
+			},
+			stopFn: func(context.Context) error {
+				stops.Add(1)
+				return nil
+			},
+		}
+	}, component.Managed[*runtimeResource]())
+	rt := newTestRuntime(t, ref)
+	err := rt.Start(context.Background())
+	requireSentinel(t, err, component.ErrPanic)
+	ne := nodeError(t, err)
+	if ne.Phase != "start" {
+		t.Fatalf("panic phase=%q, want start", ne.Phase)
+	}
+	if len(ne.Stack) == 0 {
+		t.Fatalf("panic NodeError has no stack")
+	}
+	if !strings.Contains(ne.Error(), "start panic payload") {
+		t.Fatalf("NodeError text omitted the panic payload")
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
+	}
+	if stops.Load() != 1 {
+		t.Fatalf("stop calls=%d, want 1", stops.Load())
+	}
+}
+
+func TestConstructorPanicReportsConstructPhase(t *testing.T) {
+	ref := component.Provide(func() *runtimeResource {
+		panic("construct panic payload")
+	})
+	rt := newTestRuntime(t, ref)
+	err := rt.Start(context.Background())
+	requireSentinel(t, err, component.ErrPanic)
+	ne := nodeError(t, err)
+	if ne.Phase != "construct" || len(ne.Stack) == 0 {
+		t.Fatalf("constructor panic NodeError phase=%q stack=%d", ne.Phase, len(ne.Stack))
+	}
+	if !strings.Contains(ne.Error(), "construct panic payload") {
+		t.Fatalf("NodeError text omitted the constructor panic payload")
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
+	}
+}
+
+func TestStartGoexitPreservesConstructedOwnership(t *testing.T) {
+	var stops atomic.Int32
+	ref := component.Provide(func() *runtimeResource {
+		return &runtimeResource{
+			name: "goexit-owner",
+			startFn: func(context.Context) error {
+				runtime.Goexit()
+				return nil
+			},
+			stopFn: func(context.Context) error {
+				stops.Add(1)
+				return nil
+			},
+		}
+	}, component.Managed[*runtimeResource]())
+	rt := newTestRuntime(t, ref)
+	err := rt.Start(context.Background())
+	requireSentinel(t, err, component.ErrAborted)
+	ne := nodeError(t, err)
+	if ne.Phase != "start" {
+		t.Fatalf("Goexit phase=%q, want start", ne.Phase)
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
+	}
+	if stops.Load() != 1 {
+		t.Fatalf("stop calls=%d, want 1", stops.Load())
+	}
+}
+
+func TestFailedStopLeavesNodePendingAndRetainsDependency(t *testing.T) {
+	stopFailure := errors.New("child stop failed")
+	var childStops, dependencyStops atomic.Int32
+	dependency := component.Provide(func() *runtimeResource {
+		return &runtimeResource{name: "dependency", stopFn: func(context.Context) error {
+			dependencyStops.Add(1)
+			return nil
+		}}
+	}, component.Managed[*runtimeResource]())
+	alias := dependency.Map(func(*runtimeResource) *runtimeResource {
+		return &runtimeResource{name: "alias"}
+	})
+	child := alias.Map(func(*runtimeResource) *runtimeResource {
+		return &runtimeResource{name: "child", stopFn: func(context.Context) error {
+			if childStops.Add(1) == 1 {
+				return stopFailure
+			}
+			return nil
+		}}
+	}, component.Managed[*runtimeResource]())
+	rt := newTestRuntime(t, child)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
+	}
+	first := rt.Stop(context.Background())
+	requireSentinel(t, first, component.ErrCleanupPending)
+	if !errors.Is(first, stopFailure) {
+		t.Fatalf("first Stop omitted the child failure")
+	}
+	if childStops.Load() != 1 || dependencyStops.Load() != 0 {
+		t.Fatalf("first Stop counts: child=%d dependency=%d", childStops.Load(), dependencyStops.Load())
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("retry Stop returned an error")
+	}
+	if childStops.Load() != 2 || dependencyStops.Load() != 1 {
+		t.Fatalf("retry Stop counts: child=%d dependency=%d", childStops.Load(), dependencyStops.Load())
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("terminal Stop returned an error")
+	}
+	if childStops.Load() != 2 || dependencyStops.Load() != 1 {
+		t.Fatalf("terminal Stop retried callbacks")
+	}
+}
+
+func TestFailedStopContinuesUnrelatedCleanup(t *testing.T) {
+	stopFailure := errors.New("branch A stop failed")
+	var aStops, bStops atomic.Int32
+	a := component.Provide(func() *runtimeResource {
+		return &runtimeResource{name: "a", stopFn: func(context.Context) error {
+			if aStops.Add(1) == 1 {
+				return stopFailure
+			}
+			return nil
+		}}
+	}, component.Managed[*runtimeResource]())
+	b := component.Provide(func() *runtimeResource {
+		return &runtimeResource{name: "b", stopFn: func(context.Context) error {
+			bStops.Add(1)
+			return nil
+		}}
+	}, component.Managed[*runtimeResource]())
+	rt := newTestRuntime(t, b, a)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
+	}
+	first := rt.Stop(context.Background())
+	requireSentinel(t, first, component.ErrCleanupPending)
+	if !errors.Is(first, stopFailure) {
+		t.Fatalf("first Stop omitted branch A failure")
+	}
+	if aStops.Load() != 1 || bStops.Load() != 1 {
+		t.Fatalf("first Stop counts: A=%d B=%d, want 1 each", aStops.Load(), bStops.Load())
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("retry Stop returned an error")
+	}
+	if aStops.Load() != 2 || bStops.Load() != 1 {
+		t.Fatalf("retry counts: A=%d B=%d", aStops.Load(), bStops.Load())
+	}
+}
+
+func TestStopPanicAndGoexitRemainPending(t *testing.T) {
+	t.Run("panic", func(t *testing.T) {
+		var calls atomic.Int32
+		ref := component.Provide(func() *runtimeResource {
+			return &runtimeResource{name: "panic-stop", stopFn: func(context.Context) error {
+				if calls.Add(1) == 1 {
+					panic("stop panic payload")
+				}
+				return nil
+			}}
+		}, component.Managed[*runtimeResource]())
+		rt := newTestRuntime(t, ref)
+		if err := rt.Start(context.Background()); err != nil {
+			t.Fatalf("Start returned an error")
+		}
+		first := rt.Stop(context.Background())
+		requireSentinel(t, first, component.ErrPanic)
+		requireSentinel(t, first, component.ErrCleanupPending)
+		ne := nodeError(t, first)
+		if ne.Phase != "stop" || len(ne.Stack) == 0 {
+			t.Fatalf("stop panic NodeError phase=%q stack=%d", ne.Phase, len(ne.Stack))
+		}
+		if err := rt.Stop(context.Background()); err != nil {
+			t.Fatalf("retry Stop returned an error")
+		}
+	})
+
+	t.Run("goexit", func(t *testing.T) {
+		var calls atomic.Int32
+		ref := component.Provide(func() *runtimeResource {
+			return &runtimeResource{name: "goexit-stop", stopFn: func(context.Context) error {
+				if calls.Add(1) == 1 {
+					runtime.Goexit()
+				}
+				return nil
+			}}
+		}, component.Managed[*runtimeResource]())
+		rt := newTestRuntime(t, ref)
+		if err := rt.Start(context.Background()); err != nil {
+			t.Fatalf("Start returned an error")
+		}
+		first := rt.Stop(context.Background())
+		requireSentinel(t, first, component.ErrAborted)
+		requireSentinel(t, first, component.ErrCleanupPending)
+		if err := rt.Stop(context.Background()); err != nil {
+			t.Fatalf("retry Stop returned an error")
+		}
+	})
+}
+
+func TestExactContextsReachFactoriesAndHooks(t *testing.T) {
+	startContext := &exactContext{Context: context.Background()}
+	stopContext := &exactContext{Context: context.Background()}
+	var factorySeen, startSeen, stopSeen context.Context
+	ref := component.ProvideContext(func(ctx context.Context) (*runtimeResource, error) {
+		factorySeen = ctx
+		return &runtimeResource{
+			name: "context-owner",
+			startFn: func(ctx context.Context) error {
+				startSeen = ctx
+				return nil
+			},
+			stopFn: func(ctx context.Context) error {
+				stopSeen = ctx
+				return nil
+			},
+		}, nil
+	}, component.Managed[*runtimeResource]())
+	rt := newTestRuntime(t, ref)
+	if err := rt.Start(startContext); err != nil {
+		t.Fatalf("Start returned an error")
+	}
+	if factorySeen != startContext || startSeen != startContext {
+		t.Fatalf("startup context was not passed by identity")
+	}
+	if err := rt.Stop(stopContext); err != nil {
+		t.Fatalf("Stop returned an error")
+	}
+	if stopSeen != stopContext {
+		t.Fatalf("shutdown context was not passed by identity")
+	}
+}
+
+func TestNilContextsDoNotChangeRuntimeState(t *testing.T) {
+	var creates, stops atomic.Int32
+	ref := component.Provide(func() *runtimeResource {
+		creates.Add(1)
+		return &runtimeResource{name: "nil-context", stopFn: func(context.Context) error {
+			stops.Add(1)
+			return nil
+		}}
+	}, component.Managed[*runtimeResource]())
+	rt := newTestRuntime(t, ref)
+	//lint:ignore SA1012 nil is the explicit invalid-context contract under test.
+	requireSentinel(t, rt.Start(nil), component.ErrInvalidContext)
+	if creates.Load() != 0 {
+		t.Fatalf("nil Start invoked a factory")
+	}
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("valid Start returned an error")
+	}
+	//lint:ignore SA1012 nil is the explicit invalid-context contract under test.
+	requireSentinel(t, rt.Stop(nil), component.ErrInvalidContext)
+	if stops.Load() != 0 {
+		t.Fatalf("nil Stop invoked a hook")
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("valid Stop returned an error")
+	}
+}
+
+func TestCanceledStartConsumesTheOnlyStartAttempt(t *testing.T) {
+	var creates atomic.Int32
+	ref := component.Provide(func() int {
+		creates.Add(1)
+		return 1
+	})
+	rt := newTestRuntime(t, ref)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := rt.Start(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Start did not return context cancellation")
+	}
+	if creates.Load() != 0 {
+		t.Fatalf("canceled Start invoked a factory")
+	}
+	requireSentinel(t, rt.Start(context.Background()), component.ErrAlreadyStarted)
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop after canceled Start returned an error")
+	}
+}
+
+func TestCancellationDuringFactoryStillRunsItsStartHook(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var starts, stops atomic.Int32
+	ref := component.ProvideContext(func(context.Context) (*runtimeResource, error) {
+		cancel()
+		return &runtimeResource{
+			name: "late-cancel",
+			startFn: func(context.Context) error {
+				starts.Add(1)
+				return nil
+			},
+			stopFn: func(context.Context) error {
+				stops.Add(1)
+				return nil
+			},
+		}, nil
+	}, component.Managed[*runtimeResource]())
+	rt := newTestRuntime(t, ref)
+	err := rt.Start(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start did not report final cancellation")
+	}
+	if starts.Load() != 1 {
+		t.Fatalf("start hook calls=%d, want 1", starts.Load())
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
+	}
+	if stops.Load() != 1 {
+		t.Fatalf("stop hook calls=%d, want 1", stops.Load())
+	}
+}
+
+func TestCanceledStopWaitsForInFlightCallbackAndRetainsContext(t *testing.T) {
+	entered := make(chan struct{})
+	release, releaseOnce := makeRelease(t)
+	var calls atomic.Int32
+	var observedCanceled atomic.Bool
+	ancestor := component.Value(7)
+	ref := ancestor.Map(func(int) *runtimeResource {
+		return &runtimeResource{name: "stop-context", stopFn: func(ctx context.Context) error {
+			// The callback is released only after the caller cancels its context.
+			calls.Add(1)
+			close(entered)
+			<-release
+			observedCanceled.Store(errors.Is(ctx.Err(), context.Canceled))
+			return nil
+		}}
+	}, component.Managed[*runtimeResource]())
+	rt := newTestRuntime(t, ref)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
+	}
+	stopContext, cancel := context.WithCancel(context.Background())
+	stopResult := make(chan error, 1)
+	go func() { stopResult <- rt.Stop(stopContext) }()
+	waitSignal(t, entered, "Stop callback did not start")
+	cancel()
+	releaseOnce()
+	if err := waitResult(t, stopResult, "Stop did not await its in-flight callback"); err != nil {
+		t.Fatalf("Stop returned an error after callback completed")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("stop callback calls=%d, want 1", calls.Load())
+	}
+	if !observedCanceled.Load() {
+		t.Fatalf("in-flight Stop callback did not complete after cancellation")
+	}
+}
+
+func TestCanceledStopDrainsAnAllPureGraph(t *testing.T) {
+	ref := component.Value("borrowed")
+	rt := newTestRuntime(t, ref)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := rt.Stop(ctx); err != nil {
+		t.Fatalf("canceled Stop on an all-pure graph returned an error: %v", err)
+	}
+	if _, err := rt.Value(ref); err == nil {
+		t.Fatalf("Value remained available after canceled Stop")
+	} else {
+		requireSentinel(t, err, component.ErrUnavailable)
+	}
+}
+
+func TestCanceledStopBeforeDispatchLeavesCleanupForRetry(t *testing.T) {
+	var stops atomic.Int32
+	ref := component.Provide(func() *runtimeResource {
+		return &runtimeResource{name: "late-stop", stopFn: func(context.Context) error {
+			stops.Add(1)
+			return nil
+		}}
+	}, component.Managed[*runtimeResource]())
+	rt := newTestRuntime(t, ref)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := rt.Stop(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Stop did not return context cancellation")
+	}
+	if stops.Load() != 0 {
+		t.Fatalf("canceled Stop invoked a callback")
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("retry Stop returned an error")
+	}
+	if stops.Load() != 1 {
+		t.Fatalf("retry stop calls=%d, want 1", stops.Load())
+	}
+}
+
+func TestOverlappingStartAndStopAreBusy(t *testing.T) {
+	entered := make(chan struct{})
+	release, releaseOnce := makeRelease(t)
+	ref := component.Provide(func() int {
+		close(entered)
+		<-release
+		return 1
+	})
+	rt := newTestRuntime(t, ref)
+	startResult := make(chan error, 1)
+	go func() { startResult <- rt.Start(context.Background()) }()
+	waitSignal(t, entered, "Start callback did not run")
+	requireSentinel(t, rt.Stop(context.Background()), component.ErrBusy)
+	releaseOnce()
+	if err := waitResult(t, startResult, "Start did not finish"); err != nil {
+		t.Fatalf("Start returned an error")
+	}
+	if err := rt.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned an error")
+	}
+}
+
+func TestOverlappingStopsAreBusy(t *testing.T) {
+	entered := make(chan struct{})
+	release, releaseOnce := makeRelease(t)
+	ref := component.Provide(func() *runtimeResource {
+		return &runtimeResource{name: "overlap-stop", stopFn: func(context.Context) error {
+			close(entered)
+			<-release
+			return nil
+		}}
+	}, component.Managed[*runtimeResource]())
+	rt := newTestRuntime(t, ref)
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start returned an error")
+	}
+	stopResult := make(chan error, 1)
+	go func() { stopResult <- rt.Stop(context.Background()) }()
+	waitSignal(t, entered, "first Stop callback did not run")
+	requireSentinel(t, rt.Stop(context.Background()), component.ErrBusy)
+	releaseOnce()
+	if err := waitResult(t, stopResult, "first Stop did not finish"); err != nil {
+		t.Fatalf("first Stop returned an error")
+	}
+}
+
+type panicError struct{}
+
+func (*panicError) Error() string {
+	panic("scheduler formatted a panicError")
+}
+
+type goexitError struct {
+	called atomic.Int32
+}
+
+func (e *goexitError) Error() string {
+	e.called.Add(1)
+	runtime.Goexit()
+	return "unreachable"
+}
+
+type blockingError struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (e *blockingError) Error() string {
+	close(e.entered)
+	<-e.release
+	return "blocking error"
+}
+
+type hostileCause struct{}
+
+func (*hostileCause) Error() string { return "hostile cause" }
+func (*hostileCause) Is(error) bool {
+	panic("scheduler called hostile Is")
+}
+func (*hostileCause) As(any) bool {
+	panic("scheduler called hostile As")
+}
+func (*hostileCause) Unwrap() error {
+	panic("scheduler called hostile Unwrap")
+}
+
+func TestSchedulerDoesNotFormatOrClassifyUserErrors(t *testing.T) {
+	t.Run("panic Error", func(t *testing.T) {
+		ref := component.TryProvide(func() (int, error) { return 0, &panicError{} })
+		rt := newTestRuntime(t, ref)
+		err := rt.Start(context.Background())
+		ne := nodeError(t, err)
+		if ne.Cause == nil {
+			t.Fatalf("NodeError lost the constructor cause")
+		}
+	})
+
+	t.Run("blocking Error", func(t *testing.T) {
+		release, releaseOnce := makeRelease(t)
+		hostile := &blockingError{entered: make(chan struct{}), release: release}
+		ref := component.TryProvide(func() (int, error) { return 0, hostile })
+		rt := newTestRuntime(t, ref)
+		result := make(chan error, 1)
+		go func() { result <- rt.Start(context.Background()) }()
+		select {
+		case <-hostile.entered:
+			releaseOnce()
+			t.Fatal("scheduler formatted a blocking error")
+		case err := <-result:
+			if err == nil {
+				t.Fatal("Start unexpectedly succeeded")
+			}
+		case <-time.After(time.Second):
+			releaseOnce()
+			select {
+			case <-result:
+			case <-time.After(time.Second):
+			}
+			t.Fatal("Start did not finish without formatting the error")
+		}
+	})
+
+	t.Run("Goexit Error", func(t *testing.T) {
+		hostile := &goexitError{}
+		ref := component.TryProvide(func() (int, error) { return 0, hostile })
+		rt := newTestRuntime(t, ref)
+		result := make(chan error, 1)
+		go func() { result <- rt.Start(context.Background()) }()
+		select {
+		case err := <-result:
+			if err == nil {
+				t.Fatal("Start unexpectedly succeeded")
+			}
+			if hostile.called.Load() != 0 {
+				t.Fatal("scheduler called Error on a user cause")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Start did not finish without formatting the error")
+		}
+	})
+
+	t.Run("hostile classifiers", func(t *testing.T) {
+		cause := &hostileCause{}
+		ref := component.TryProvide(func() (int, error) { return 0, cause })
+		rt := newTestRuntime(t, ref)
+		err := rt.Start(context.Background())
+		ne := nodeError(t, err)
+		if ne.Cause != cause {
+			t.Fatalf("NodeError changed the opaque cause")
+		}
+	})
+}
+
+func TestConstructorGoexitLeavesPartialCleanupWithFactory(t *testing.T) {
+	var localCleanup atomic.Int32
+	ref := component.Provide(func() *runtimeResource {
+		defer localCleanup.Add(1)
+		runtime.Goexit()
+		return nil
+	})
+	rt := newTestRuntime(t, ref)
+	err := rt.Start(t.Context())
+	requireSentinel(t, err, component.ErrAborted)
+	if got := nodeError(t, err).Phase; got != "construct" {
+		t.Fatalf("aborted phase = %q, want construct", got)
+	}
+	if err := rt.Stop(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if localCleanup.Load() != 1 {
+		t.Fatalf("factory cleanup=%d, want 1", localCleanup.Load())
+	}
+}
+
+func TestEmptyRuntimeAndStopBeforeStartRemainOneShot(t *testing.T) {
+	t.Run("empty graph", func(t *testing.T) {
+		rt := newTestRuntime(t)
+		if err := rt.Start(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := rt.Stop(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := rt.Stop(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		requireSentinel(t, rt.Start(t.Context()), component.ErrAlreadyStarted)
+	})
+	t.Run("stop before start", func(t *testing.T) {
+		var calls atomic.Int32
+		ref := component.Provide(func() int { calls.Add(1); return 7 })
+		rt := newTestRuntime(t, ref)
+		if err := rt.Stop(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		requireSentinel(t, rt.Start(t.Context()), component.ErrAlreadyStarted)
+		if calls.Load() != 0 {
+			t.Fatalf("factory calls = %d, want 0", calls.Load())
+		}
+	})
 }
