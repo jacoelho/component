@@ -1,9 +1,12 @@
 # Component
 
-`component` coordinates Go resource owners in dependency order. Dependencies
-are configured and started before their dependents; dependents are stopped
-before their dependencies. Owners may be wired manually or constructed from
-typed provider functions after the complete graph has been validated.
+`component` builds a typed construction graph and runs its owned resources in
+dependency order. A dependency is ready before a dependent starts, and a
+dependent has finished stopping before its dependency is stopped.
+
+The graph is ordinary Go code. Constructors receive ordinary values, so the
+application keeps its own types, interfaces, closures, and resource policies.
+References exist only in composition code.
 
 ## Install
 
@@ -13,141 +16,164 @@ Requires Go 1.27 or later.
 go get github.com/jacoelho/component
 ```
 
-## Lifecycle interface
-
-Register types that implement `Lifecycle`:
+## Quick start
 
 ```go
-type Lifecycle interface {
-	Configure(context.Context) error
-	Start(context.Context) error
-	Stop(context.Context) error
+type Database struct{}
+type Service struct{ database *Database }
+
+func openDatabase() *Database { return &Database{} }
+func newService(database *Database) *Service {
+	return &Service{database: database}
 }
-```
 
-- `Configure` prepares reversible, non-live state.
-- `Start` makes the owner live and returns when it is ready.
-- `Stop` releases configured or started state. It must support partial setup
-  and retries after a failed stop.
+func (*Database) Start(context.Context) error { return nil }
+func (*Database) Stop(context.Context) error  { return nil }
 
-A lifecycle owner is responsible for the resources and goroutines it creates.
-Callbacks must observe context cancellation. `LifecycleFuncs` adapts functions
-or external APIs to this interface; nil callbacks are no-ops.
+database := component.Provide(openDatabase, component.Managed[*Database]())
+service := database.Map(newService)
 
-## Principles and features
-
-- `Register` adds an already constructed owner and explicit lifecycle-ordering
-  edges.
-- `Provide` adds an inert constructor. Its parameters resolve to registered
-  lifecycle owners and also create lifecycle-ordering edges.
-- `NewNode[T]` creates a distinct identity tied to lifecycle type `T`. Its
-  string label is used only in diagnostics.
-- `Compile` validates all types, bindings, references, and cycles before
-  invoking any provider constructor. Independent owners at the same dependency
-  level run concurrently during lifecycle callbacks.
-- `Start` configures the complete graph before starting any owner. It never
-  calls `Stop`; the application decides whether and how to clean up a failed
-  start.
-- `Stop` runs in reverse dependency order. Failed owners remain eligible for a
-  later retry, while owners already stopped successfully are not called again.
-- A runtime cannot restart after a `Start` attempt or a `Stop` call.
-
-## Provider composition
-
-Assume `Database` and `Server` are application types that implement
-`Lifecycle`:
-
-```go
-registry := component.NewRegistry()
-_, err := registry.Provide("database", func() *Database {
-	return NewDatabase(databaseConfig)
-})
-if err != nil {
-	return err
-}
-_, err = registry.Provide("server", func(database *Database) (*Server, error) {
-	return NewServer(serverConfig, database)
-})
+runtime, err := component.New(component.RuntimeOptions{}, service)
 if err != nil {
 	return err
 }
 
-runtime, err := registry.Compile()
-if err != nil {
-	return err
-}
+startCtx, cancelStart := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancelStart()
 if err := runtime.Start(startCtx); err != nil {
-	return err
+	// Start does not roll back acquired resources. The application still owns
+	// cleanup and supplies the shutdown policy.
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelStop()
+	return errors.Join(err, runtime.Stop(stopCtx))
 }
 
-// The application decides when to stop and supplies a separate context.
+stopCtx, cancelStop := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancelStop()
 return runtime.Stop(stopCtx)
 ```
 
-Provider constructors must return `T` or `(T, error)`, where `T` implements
-`Lifecycle`. Constructors run sequentially in dependency order during
-`Compile`; they must be finite and inert. Acquire resources and start
-goroutines in `Configure` or `Start`, where a context and runtime cleanup are
-available. Constructor parameters are borrowed owners: a dependent must stop
-only resources it creates, never an injected owner.
+`Start` and `Stop` receive independent caller-created contexts. The library
+does not install signal handlers, create replacement contexts, retry work in
+the background, or provide a `Run` helper.
 
-For each constructor parameter, resolution uses:
+## Construction
 
-1. An explicit `Bind[T]`.
-2. One owner declared as exactly `T`.
-3. For an interface `T`, one owner whose declared type implements `T`.
-
-Missing and ambiguous parameters fail `Compile` before any provider constructor
-runs. `Provide` still rejects an invalid local constructor signature or
-`orderAfter` reference immediately, and `Bind` rejects an invalid local binding
-immediately. When several owners implement an interface, bind the intended
-owner:
+`Value` supplies an existing borrowed value. It never invokes a function and
+never takes ownership:
 
 ```go
-loggerRef, err := registry.Provide("logger", NewLogger)
-if err != nil {
-	return err
-}
-if err := registry.Bind[Logger](loggerRef); err != nil {
-	return err
-}
+config := component.Value(existingConfig)
+client := config.Map(client.New)
 ```
 
-`Bind` selects injection only: every registered owner is still part of the
-lifecycle runtime. Register only the implementations that should run. Labels
-are diagnostic and never affect resolution.
-
-Manual registration remains available when the application needs the value
-before `Compile`:
+Use a no-error constructor with `Provide` or `Map`, an error-returning
+constructor with `TryProvide` or `TryMap`, and a context-taking acquisition
+with `ProvideContext` or `MapContext`:
 
 ```go
-registry := component.NewRegistry()
-database := NewDatabase(databaseConfig)
-server := NewServer(serverConfig, database)
-databaseNode := component.NewNode[*Database]("database")
-serverNode := component.NewNode[*Server]("server")
+credentials := component.ProvideContext(func(ctx context.Context) (*Credentials, error) {
+	return loadCredentials(ctx)
+})
 
-if err := registry.Register(databaseNode, database); err != nil {
-	return err
-}
-if err := registry.Register(serverNode, server, databaseNode); err != nil {
-	return err
-}
+database := component.TryProvide(openDatabaseWithError)
+service := database.TryMap(newServiceWithError)
 ```
 
-Manual declarations participate in provider resolution using the static `T`
-from `NewNode[T]`, never the value's dynamic type. No runtime value lookup is
-provided.
+For an existing context-taking constructor with no error result, keep the
+adaptation explicit at the call site:
 
-Structural compile failures leave the registry editable and invoke no provider
-constructor. Once validation succeeds, the registry is consumed before
-construction begins. A constructor error, panic, `runtime.Goexit`, or nil
-lifecycle returns `ErrConstruction`, no runtime, and invokes no lifecycle
-callback. Manually constructed values remain the caller's cleanup
-responsibility whenever `Compile` returns an error.
+```go
+mapped := ref.MapContext(func(ctx context.Context, value A) (B, error) {
+	return NewValue(ctx, value), nil
+})
+```
 
-## Complex example
+The same three forms are available on `Inputs2`, `Inputs3`, and `Inputs4` for
+one through four typed inputs. Compose a normal Go value for a larger
+constructor instead of using reflection:
 
-[`ExampleRuntime_gracefulHTTPShutdown`](example_test.go#L299) registers an HTTP
-handler and server, owns the listener and serving goroutine, handles OS signals,
-drains in-flight requests, and uses independent startup and shutdown contexts.
+```go
+storage := store.With(cache).With(logger).Map(func(s Store, c Cache, l Logger) StorageInputs {
+	return StorageInputs{Store: s, Cache: c, Logger: l}
+})
+service := storage.With(httpConfig).With(jobConfig).Map(func(
+	s StorageInputs,
+	h HTTPConfig,
+	j JobConfig,
+) *Service {
+	return NewLargeService(s.Store, s.Cache, s.Logger, h, j)
+})
+```
+
+Interface adaptation remains ordinary Go assignment inside a closure:
+
+```go
+handler := database.Map(func(db *Database) *Handler {
+	return NewHandler(db) // NewHandler accepts the Store interface.
+})
+```
+
+Each `Ref[T]` is typed and comparable even when `T` is a slice, map, or
+function. References of different `T` values cannot be explicitly converted.
+The compiler checks arity, input/output types, closure bodies, and lifecycle
+method sets. `New` checks graph validity before any constructor runs.
+
+## Ownership and lifecycle
+
+A constructor without an ownership argument produces an unmanaged value. A
+constructor with one `Ownership[T]` from `Managed[T]` produces an owned
+resource. `T` implements the `Lifecycle` interface, whose `Start` and `Stop`
+methods receive only the caller's context. `Start` is required, even for an
+inert resource; its method can return nil. An unmanaged value stays unmanaged
+even if it happens to implement `Lifecycle`:
+
+```go
+source := sink.Map(NewSource, component.Managed[*Source]())
+
+named := component.Managed[*Source]()
+named.Name = "source" // optional diagnostic name
+namedSource := sink.Map(NewSource, named)
+```
+
+An owned factory must create a distinct resource for that runtime. It must not
+return an input or another owned object. Go cannot prove freshness, so this is
+an application contract. Use `Value` for an intentionally shared borrowed
+object.
+
+Every owned `Stop` method must tolerate repeated calls and partial cleanup. A
+nil result means the node is complete. An error leaves it pending; the next
+caller `Stop` may retry it once, while successful stops are never repeated.
+The library does not guess whether a third-party `Close` made progress or
+translate an already-closed error. Adapt such APIs in application code.
+
+The runtime is one-shot. The application calls `Stop` after a failed `Start`
+to release resources that were successfully constructed, including resources
+whose `Start` method failed. The runtime waits for all user callbacks before an
+operation returns and bounds concurrent callbacks with `RuntimeOptions`:
+
+```go
+runtime, err := component.New(component.RuntimeOptions{Parallelism: 4}, root)
+```
+
+The default parallelism is one. A negative value is invalid.
+
+## Context and values
+
+Context-taking factories and lifecycle methods receive exactly the context
+supplied by the caller. Cancellation prevents new work from being dispatched and waits for
+callbacks already in flight; it cannot forcibly stop user code. Nil contexts
+are rejected before runtime state changes. `Runtime.Value(ref)` is available
+only while a runtime is successfully running and returns a typed value; it is
+not a resolver for constructors.
+
+## Complete examples and architecture
+
+[`integration_test.go`](integration_test.go) contains a deterministic
+source-to-processor-to-sink pipeline and a hermetic HTTP listener example. The
+tests show readiness handshakes, graceful drain, caller-owned contexts, and
+cleanup after failed startup.
+
+[`ARCHITECTURE.md`](ARCHITECTURE.md) is the canonical architecture entry point.
+[`REWRITE_PLAN.md`](REWRITE_PLAN.md) is the historical rewrite and review
+record.

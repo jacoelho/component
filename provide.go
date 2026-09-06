@@ -1,207 +1,120 @@
 package component
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 )
 
-var (
-	lifecycleType = reflect.TypeFor[Lifecycle]()
-	errorType     = reflect.TypeFor[error]()
-)
-
-type providerEntry struct {
-	node         nodeDescriptor
-	constructor  reflect.Value
-	parameters   []reflect.Type
-	returnsError bool
-	orderAfter   []nodeDescriptor
+// Value supplies an already-created borrowed value. A function value is
+// stored as a value and is never invoked by the component package.
+func Value[T any](value T) Ref[T] {
+	return Ref[T]{node: &definition{
+		declaredType: reflect.TypeFor[T](),
+		create: func(context.Context, []any) (any, error) {
+			return &valueCell[T]{value: value}, nil
+		},
+	}}
 }
 
-type providedNode struct {
-	identity *nodeIdentity
+// Provide declares a no-error, context-free factory.
+func Provide[T any](create func() T, ownership ...Ownership[T]) Ref[T] {
+	if create == nil {
+		return invalidDefinition[T]("Provide requires a non-nil constructor")
+	}
+	return newDefinition(nil, func(context.Context, []any) (T, error) {
+		return create(), nil
+	}, ownership...)
 }
 
-func (n *providedNode) String() string {
-	if n == nil || n.identity == nil {
-		return "<invalid>"
+// TryProvide declares a context-free factory that may fail.
+func TryProvide[T any](create func() (T, error), ownership ...Ownership[T]) Ref[T] {
+	if create == nil {
+		return invalidDefinition[T]("TryProvide requires a non-nil constructor")
 	}
-	return n.identity.label
+	return newDefinition(nil, func(context.Context, []any) (T, error) {
+		return create()
+	}, ownership...)
 }
 
-func (n *providedNode) nodeIdentity() *nodeIdentity {
-	if n == nil {
-		return nil
+// ProvideContext declares a factory that receives the caller's startup
+// context and may fail.
+func ProvideContext[T any](create func(context.Context) (T, error), ownership ...Ownership[T]) Ref[T] {
+	if create == nil {
+		return invalidDefinition[T]("ProvideContext requires a non-nil constructor")
 	}
-	return n.identity
+	return newDefinition(nil, func(ctx context.Context, _ []any) (T, error) {
+		return create(ctx)
+	}, ownership...)
 }
 
-// Provide declares a lifecycle constructor. Compile resolves its parameters
-// from registered lifecycle owners, validates the complete graph, and invokes
-// constructors in dependency order.
-//
-// A constructor must be a non-variadic func(D1, ..., Dn) T or
-// func(D1, ..., Dn) (T, error), where T implements Lifecycle. Constructors
-// must be inert: acquire resources in Configure or Start, not here. Injected
-// owners are borrowed; a dependent must stop only the resources it creates.
-func (r *Registry) Provide(
-	label string,
-	constructor any,
-	orderAfter ...NodeRef,
-) (NodeRef, error) {
-	if r == nil {
-		return nil, fmt.Errorf("component: provide on nil registry")
+type typedFactory[T any] func(context.Context, []any) (T, error)
+
+func newDefinition[T any](inputs []*definition, factory typedFactory[T], ownership ...Ownership[T]) Ref[T] {
+	d := &definition{
+		inputs:       append([]*definition(nil), inputs...),
+		declaredType: reflect.TypeFor[T](),
 	}
 
-	core := r.ensureCore()
-	core.mu.Lock()
-	defer core.mu.Unlock()
-	if core.consumed {
-		return nil, ErrRegistryConsumed
+	if len(ownership) > 1 {
+		d.err = invalidDefinitionError("at most one ownership declaration is allowed")
+		return Ref[T]{node: d}
 	}
 
-	entry, err := inspectConstructor(label, constructor)
-	if err != nil {
-		return nil, err
-	}
-
-	dependencies := make([]nodeDescriptor, 0, len(orderAfter))
-	seen := make(map[*nodeIdentity]struct{}, len(orderAfter))
-	for _, dependency := range orderAfter {
-		identity := nodeRefIdentity(dependency)
-		if identity == nil {
-			return nil, fmt.Errorf(
-				"%w: order-only dependency of provider %q",
-				ErrInvalidNode,
-				label,
-			)
+	owned := len(ownership) == 1
+	if owned {
+		configured := ownership[0]
+		d.name = configured.Name
+		if configured.bind == nil {
+			d.err = invalidDefinitionError("ownership must be declared with Managed")
+			return Ref[T]{node: d}
 		}
-		if _, exists := seen[identity]; exists {
-			return nil, fmt.Errorf(
-				"%w: provider %q depends on %q more than once",
-				ErrDuplicateDependency,
-				label,
-				dependency.String(),
-			)
+		d.start = func(ctx context.Context, boxed any) error {
+			return configured.bind(boxed.(*valueCell[T]).value).Start(ctx)
 		}
-		seen[identity] = struct{}{}
-		dependencies = append(dependencies, descriptor(dependency))
-	}
-
-	identity := newNodeIdentity(label, entry.node.declaredType)
-	entry.node = nodeDescriptor{
-		identity:     identity,
-		label:        identity.label,
-		ordinal:      identity.ordinal,
-		declaredType: identity.declaredType,
-	}
-	entry.orderAfter = dependencies
-	if core.providers == nil {
-		core.providers = make(map[*nodeIdentity]providerEntry)
-	}
-	core.providers[identity] = entry
-	return &providedNode{identity: identity}, nil
-}
-
-func inspectConstructor(label string, constructor any) (providerEntry, error) {
-	value := reflect.ValueOf(constructor)
-	if !value.IsValid() || value.Kind() != reflect.Func || value.IsNil() {
-		return providerEntry{}, fmt.Errorf(
-			"%w: provider %q requires a non-nil function",
-			ErrInvalidConstructor,
-			label,
-		)
-	}
-
-	typeOf := value.Type()
-	if typeOf.IsVariadic() {
-		return providerEntry{}, fmt.Errorf(
-			"%w: provider %q constructor %s is variadic",
-			ErrInvalidConstructor,
-			label,
-			typeOf,
-		)
-	}
-	if typeOf.NumOut() != 1 && typeOf.NumOut() != 2 {
-		return providerEntry{}, fmt.Errorf(
-			"%w: provider %q constructor %s must return T or (T, error)",
-			ErrInvalidConstructor,
-			label,
-			typeOf,
-		)
-	}
-	if typeOf.NumOut() == 2 && typeOf.Out(1) != errorType {
-		return providerEntry{}, fmt.Errorf(
-			"%w: provider %q constructor %s second result must be error",
-			ErrInvalidConstructor,
-			label,
-			typeOf,
-		)
-	}
-	resultType := typeOf.Out(0)
-	if !resultType.Implements(lifecycleType) {
-		return providerEntry{}, fmt.Errorf(
-			"%w: provider %q result %s does not implement Lifecycle",
-			ErrInvalidConstructor,
-			label,
-			resultType,
-		)
-	}
-
-	parameters := make([]reflect.Type, typeOf.NumIn())
-	for index := range parameters {
-		parameters[index] = typeOf.In(index)
-	}
-	return providerEntry{
-		node:         nodeDescriptor{declaredType: resultType},
-		constructor:  value,
-		parameters:   parameters,
-		returnsError: typeOf.NumOut() == 2,
-	}, nil
-}
-
-// Bind selects owner whenever a provider constructor requests T. It creates
-// no lifecycle owner, transfers no ownership, and does not prevent other
-// registered owners from running.
-func (r *Registry) Bind[T any](owner NodeRef) error {
-	if r == nil {
-		return fmt.Errorf("component: bind on nil registry")
-	}
-
-	core := r.ensureCore()
-	core.mu.Lock()
-	defer core.mu.Unlock()
-	if core.consumed {
-		return ErrRegistryConsumed
-	}
-
-	identity := nodeRefIdentity(owner)
-	if identity == nil {
-		return fmt.Errorf("%w: binding owner", ErrInvalidNode)
-	}
-
-	if _, registered := core.declarations[identity]; !registered {
-		if _, provided := core.providers[identity]; !provided {
-			return fmt.Errorf("%w: binding owner %q", ErrNotRegistered, owner.String())
+		d.stop = func(ctx context.Context, boxed any) error {
+			return configured.bind(boxed.(*valueCell[T]).value).Stop(ctx)
 		}
 	}
 
-	boundType := reflect.TypeFor[T]()
-	if !identity.declaredType.AssignableTo(boundType) {
-		return fmt.Errorf(
-			"%w: owner %q declared as %s is not assignable to %s",
-			ErrInvalidBinding,
-			owner.String(),
-			identity.declaredType,
-			boundType,
-		)
+	d.create = func(ctx context.Context, args []any) (any, error) {
+		value, err := factory(ctx, args)
+		if err != nil {
+			return nil, err
+		}
+		if owned && isNilValue(value) {
+			return nil, fmt.Errorf("%w: managed factory returned nil %s", ErrInvalidValue, d.declaredType)
+		}
+		return &valueCell[T]{value: value}, nil
 	}
-	if _, exists := core.bindings[boundType]; exists {
-		return fmt.Errorf("%w: type %s is already bound", ErrInvalidBinding, boundType)
+	return Ref[T]{node: d}
+}
+
+func invalidDefinition[T any](reason string) Ref[T] {
+	return Ref[T]{node: &definition{
+		declaredType: reflect.TypeFor[T](),
+		err:          invalidDefinitionError(reason),
+	}}
+}
+
+func invalidDefinitionError(reason string) error {
+	return fmt.Errorf("%w: %s", ErrInvalidDefinition, reason)
+}
+
+func isNilValue[T any](value T) bool {
+	boxed := reflect.ValueOf(value)
+	if !boxed.IsValid() {
+		return true
 	}
-	if core.bindings == nil {
-		core.bindings = make(map[reflect.Type]*nodeIdentity)
+	switch boxed.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		return boxed.IsNil()
+	default:
+		return false
 	}
-	core.bindings[boundType] = identity
-	return nil
+}
+
+func inputValue[T any](args []any, index int) T {
+	return args[index].(*valueCell[T]).value
 }
