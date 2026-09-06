@@ -28,6 +28,12 @@ one `Ownership[T]` from `Managed[T]` is supplied. `T` must implement the
 factory that creates an object is the only owner that can declare its stop
 policy. Decorating an existing ref with an owning alias is not supported.
 
+References for different value types cannot be converted into one another.
+A phantom pointer array to the named generic `valueCell[T]` preserves this
+boundary even for anonymous structs differing only in tags, while keeping
+references comparable for slice, map, and function values. A direct `*T`
+marker would permit tag-only conversions and break typed runtime retrieval.
+
 `Managed[T]` requires `Start` even for an inert resource; an inert method can
 return nil. `Stop` owns all retry and partial-cleanup behavior. An unmanaged
 value remains unmanaged even if its type implements `Lifecycle`.

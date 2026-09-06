@@ -3,6 +3,7 @@ package component_test
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sync/atomic"
 	"testing"
 
@@ -10,6 +11,32 @@ import (
 )
 
 type constructorContextKey struct{}
+
+func TestRefRejectsTagOnlyConversions(t *testing.T) {
+	type before = struct {
+		Value int `json:"before"`
+	}
+	type after = struct {
+		Value int `json:"after"`
+	}
+	from := reflect.TypeFor[component.Ref[before]]()
+	to := reflect.TypeFor[component.Ref[after]]()
+	if from.ConvertibleTo(to) {
+		t.Fatal("references with different value types must not be convertible, including tag-only differences")
+	}
+}
+
+func TestRefRemainsComparableForNonComparableValues(t *testing.T) {
+	for _, typ := range []reflect.Type{
+		reflect.TypeFor[component.Ref[[]byte]](),
+		reflect.TypeFor[component.Ref[map[string]int]](),
+		reflect.TypeFor[component.Ref[func()]](),
+	} {
+		if !typ.Comparable() {
+			t.Errorf("%v must be comparable", typ)
+		}
+	}
+}
 
 func TestFourInputCompositionPreservesTypedOrder(t *testing.T) {
 	a := component.Value("a")

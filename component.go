@@ -14,11 +14,11 @@ type Root interface {
 // Ref describes one typed definition in a construction graph. It carries no
 // runtime instance; a Runtime creates one instance for each reachable Ref.
 //
-// The zero-length phantom field makes Ref instantiations for different T
-// structurally distinct while keeping every Ref comparable, even when T is a
-// slice, map, or function.
+// The named valueCell marker prevents conversions between different T,
+// including structs differing only in tags. Its zero-length pointer array
+// keeps every Ref comparable, even when T is a slice, map, or function.
 type Ref[T any] struct {
-	_    [0]*T
+	_    [0]*valueCell[T]
 	node *definition
 }
 
