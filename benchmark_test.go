@@ -13,7 +13,7 @@ func BenchmarkNew(b *testing.B) {
 	b.Run("chain", func(b *testing.B) {
 		root := component.Value(0)
 		for range size {
-			root = root.Map(func(value int) int { return value + 1 })
+			root = component.MapValue(root, func(value int) int { return value + 1 })
 		}
 		b.ReportAllocs()
 		for b.Loop() {
@@ -26,7 +26,7 @@ func BenchmarkNew(b *testing.B) {
 		source := component.Value(0)
 		roots := make([]component.Root, size)
 		for index := range roots {
-			roots[index] = source.Map(func(value int) int { return value + 1 })
+			roots[index] = component.MapValue(source, func(value int) int { return value + 1 })
 		}
 		b.ReportAllocs()
 		for b.Loop() {

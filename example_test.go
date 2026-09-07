@@ -29,13 +29,13 @@ func (database *exampleDatabase) Stop(context.Context) error {
 
 func Example() {
 	events := []string{}
-	database := component.Provide(
+	database := component.ProvideValue(
 		func() *exampleDatabase {
 			return &exampleDatabase{events: &events}
 		},
 		component.Managed[*exampleDatabase](),
 	)
-	service := database.Map(func(database *exampleDatabase) *exampleService {
+	service := component.MapValue(database, func(database *exampleDatabase) *exampleService {
 		*database.events = append(*database.events, "construct service")
 		return &exampleService{database: database}
 	})

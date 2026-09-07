@@ -215,17 +215,17 @@ func TestPipelineReadinessDrainAndReverseStop(t *testing.T) {
 	trace := &pipelineTrace{}
 	var source *pipelineSource
 
-	sinkRef := component.Provide(
+	sinkRef := component.ProvideValue(
 		func() *pipelineSink { return newPipelineSink(trace) },
 		component.Managed[*pipelineSink](),
 	)
-	processorRef := sinkRef.Map(
+	processorRef := component.MapValue(sinkRef,
 		func(sink *pipelineSink) *pipelineProcessor {
 			return newPipelineProcessor(sink, trace)
 		},
 		component.Managed[*pipelineProcessor](),
 	)
-	sourceRef := processorRef.Map(
+	sourceRef := component.MapValue(processorRef,
 		func(processor *pipelineProcessor) *pipelineSource {
 			source = newPipelineSource(processor, trace)
 			return source
@@ -442,7 +442,7 @@ func TestHTTPServerOwnsListenerAndGracefullyDrains(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	handlerRef := component.Value(handler)
-	serverRef := handlerRef.MapContext(
+	serverRef := component.MapContext(handlerRef,
 		func(ctx context.Context, handler *integrationHTTPHandler) (*integrationHTTPServer, error) {
 			return newIntegrationHTTPServer(ctx, handler)
 		},
@@ -579,7 +579,7 @@ func TestHTTPListenerIsReleasedAfterStartFailure(t *testing.T) {
 	}
 	handlerRef := component.Value(handler)
 	var created *integrationHTTPServer
-	serverRef := handlerRef.MapContext(
+	serverRef := component.MapContext(handlerRef,
 		func(ctx context.Context, handler *integrationHTTPHandler) (*integrationHTTPServer, error) {
 			server, err := newIntegrationHTTPServer(ctx, handler)
 			if err == nil {
