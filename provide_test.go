@@ -34,133 +34,133 @@ func (value *testResult) Stop(context.Context) error {
 	return nil
 }
 
-func provideZero() *testResult { return &testResult{value: 2357} }
+func provideValueZero() *testResult { return &testResult{value: 2357} }
 
-func tryProvideZero() (*testResult, error) { return provideZero(), nil }
+func provideZero() (*testResult, error) { return provideValueZero(), nil }
 
-func provideContextZero(context.Context) (*testResult, error) { return provideZero(), nil }
+func provideContextZero(context.Context) (*testResult, error) { return provideValueZero(), nil }
 
-func provideOne(first int) *testResult { return &testResult{value: 1000 + first} }
+func provideValueOne(first int) *testResult { return &testResult{value: 1000 + first} }
 
-func tryProvideOne(first int) (*testResult, error) { return provideOne(first), nil }
+func provideOne(first int) (*testResult, error) { return provideValueOne(first), nil }
 
 func provideContextOne(_ context.Context, first int) (*testResult, error) {
-	return provideOne(first), nil
+	return provideValueOne(first), nil
 }
 
-func provideTwo(first, second int) *testResult {
+func provideValueTwo(first, second int) *testResult {
 	return &testResult{value: first*100 + second}
 }
 
-func tryProvideTwo(first, second int) (*testResult, error) {
-	return provideTwo(first, second), nil
+func provideTwo(first, second int) (*testResult, error) {
+	return provideValueTwo(first, second), nil
 }
 
 func provideContextTwo(_ context.Context, first, second int) (*testResult, error) {
-	return provideTwo(first, second), nil
+	return provideValueTwo(first, second), nil
 }
 
-func provideThree(first, second, third int) *testResult {
+func provideValueThree(first, second, third int) *testResult {
 	return &testResult{value: first*100 + second*10 + third}
 }
 
-func tryProvideThree(first, second, third int) (*testResult, error) {
-	return provideThree(first, second, third), nil
+func provideThree(first, second, third int) (*testResult, error) {
+	return provideValueThree(first, second, third), nil
 }
 
 func provideContextThree(_ context.Context, first, second, third int) (*testResult, error) {
-	return provideThree(first, second, third), nil
+	return provideValueThree(first, second, third), nil
 }
 
-func provideFour(first, second, third, fourth int) *testResult {
+func provideValueFour(first, second, third, fourth int) *testResult {
 	return &testResult{value: first*1000 + second*100 + third*10 + fourth}
 }
 
-func tryProvideFour(first, second, third, fourth int) (*testResult, error) {
-	return provideFour(first, second, third, fourth), nil
+func provideFour(first, second, third, fourth int) (*testResult, error) {
+	return provideValueFour(first, second, third, fourth), nil
 }
 
 func provideContextFour(_ context.Context, first, second, third, fourth int) (*testResult, error) {
-	return provideFour(first, second, third, fourth), nil
+	return provideValueFour(first, second, third, fourth), nil
+}
+
+func provideValueZeroRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
+	return component.ProvideValue(provideValueZero, ownership...)
 }
 
 func provideZeroRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
 	return component.Provide(provideZero, ownership...)
 }
 
-func tryProvideZeroRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
-	return component.TryProvide(tryProvideZero, ownership...)
-}
-
 func provideContextZeroRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
 	return component.ProvideContext(provideContextZero, ownership...)
 }
 
-func provideOneRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
-	return component.Value(2).Map(provideOne, ownership...)
+func provideValueOneRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
+	return component.MapValue(component.Value(2), provideValueOne, ownership...)
 }
 
-func tryProvideOneRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
-	return component.Value(2).TryMap(tryProvideOne, ownership...)
+func provideOneRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
+	return component.Map(component.Value(2), provideOne, ownership...)
 }
 
 func provideContextOneRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
-	return component.Value(2).MapContext(provideContextOne, ownership...)
+	return component.MapContext(component.Value(2), provideContextOne, ownership...)
+}
+
+func provideValueTwoRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
+	return component.MapValue2(component.Value(2), component.Value(3), provideValueTwo, ownership...)
 }
 
 func provideTwoRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
-	return component.Value(2).With(component.Value(3)).Map(provideTwo, ownership...)
-}
-
-func tryProvideTwoRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
-	return component.Value(2).With(component.Value(3)).TryMap(tryProvideTwo, ownership...)
+	return component.Map2(component.Value(2), component.Value(3), provideTwo, ownership...)
 }
 
 func provideContextTwoRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
-	return component.Value(2).With(component.Value(3)).MapContext(provideContextTwo, ownership...)
+	return component.MapContext2(component.Value(2), component.Value(3), provideContextTwo, ownership...)
+}
+
+func provideValueThreeRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
+	return component.MapValue3(component.Value(2), component.Value(3), component.Value(5), provideValueThree, ownership...)
 }
 
 func provideThreeRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
-	return component.Value(2).With(component.Value(3)).With(component.Value(5)).Map(provideThree, ownership...)
-}
-
-func tryProvideThreeRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
-	return component.Value(2).With(component.Value(3)).With(component.Value(5)).TryMap(tryProvideThree, ownership...)
+	return component.Map3(component.Value(2), component.Value(3), component.Value(5), provideThree, ownership...)
 }
 
 func provideContextThreeRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
-	return component.Value(2).With(component.Value(3)).With(component.Value(5)).MapContext(provideContextThree, ownership...)
+	return component.MapContext3(component.Value(2), component.Value(3), component.Value(5), provideContextThree, ownership...)
+}
+
+func provideValueFourRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
+	return component.MapValue4(component.Value(2), component.Value(3), component.Value(5), component.Value(7), provideValueFour, ownership...)
 }
 
 func provideFourRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
-	return component.Value(2).With(component.Value(3)).With(component.Value(5)).With(component.Value(7)).Map(provideFour, ownership...)
-}
-
-func tryProvideFourRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
-	return component.Value(2).With(component.Value(3)).With(component.Value(5)).With(component.Value(7)).TryMap(tryProvideFour, ownership...)
+	return component.Map4(component.Value(2), component.Value(3), component.Value(5), component.Value(7), provideFour, ownership...)
 }
 
 func provideContextFourRef(ownership ...component.Ownership[*testResult]) component.Ref[*testResult] {
-	return component.Value(2).With(component.Value(3)).With(component.Value(5)).With(component.Value(7)).MapContext(provideContextFour, ownership...)
+	return component.MapContext4(component.Value(2), component.Value(3), component.Value(5), component.Value(7), provideContextFour, ownership...)
 }
 
 func resultFormCases() []resultFormCase {
 	return []resultFormCase{
-		{name: "provide/0", build: provideZeroRef, want: 2357},
-		{name: "try-provide/0", build: tryProvideZeroRef, want: 2357},
-		{name: "provide-context/0", build: provideContextZeroRef, want: 2357},
-		{name: "provide/1", build: provideOneRef, want: 1002},
-		{name: "try-provide/1", build: tryProvideOneRef, want: 1002},
-		{name: "provide-context/1", build: provideContextOneRef, want: 1002},
-		{name: "provide/2", build: provideTwoRef, want: 203},
-		{name: "try-provide/2", build: tryProvideTwoRef, want: 203},
-		{name: "provide-context/2", build: provideContextTwoRef, want: 203},
-		{name: "provide/3", build: provideThreeRef, want: 235},
-		{name: "try-provide/3", build: tryProvideThreeRef, want: 235},
-		{name: "provide-context/3", build: provideContextThreeRef, want: 235},
-		{name: "provide/4", build: provideFourRef, want: 2357},
-		{name: "try-provide/4", build: tryProvideFourRef, want: 2357},
-		{name: "provide-context/4", build: provideContextFourRef, want: 2357},
+		{name: "ProvideValue", build: provideValueZeroRef, want: 2357},
+		{name: "Provide", build: provideZeroRef, want: 2357},
+		{name: "ProvideContext", build: provideContextZeroRef, want: 2357},
+		{name: "MapValue", build: provideValueOneRef, want: 1002},
+		{name: "Map", build: provideOneRef, want: 1002},
+		{name: "MapContext", build: provideContextOneRef, want: 1002},
+		{name: "MapValue2", build: provideValueTwoRef, want: 203},
+		{name: "Map2", build: provideTwoRef, want: 203},
+		{name: "MapContext2", build: provideContextTwoRef, want: 203},
+		{name: "MapValue3", build: provideValueThreeRef, want: 235},
+		{name: "Map3", build: provideThreeRef, want: 235},
+		{name: "MapContext3", build: provideContextThreeRef, want: 235},
+		{name: "MapValue4", build: provideValueFourRef, want: 2357},
+		{name: "Map4", build: provideFourRef, want: 2357},
+		{name: "MapContext4", build: provideContextFourRef, want: 2357},
 	}
 }
 
@@ -217,9 +217,9 @@ func TestConstructionFormsAcrossArities(t *testing.T) {
 type definedResultFactory func() *testResult
 
 func TestDefinedFactoryAndManagedOwner(t *testing.T) {
-	var factory definedResultFactory = provideZero
-	definedRef := component.Provide(factory)
-	managedRef := component.Provide(provideZero, component.Managed[*testResult]())
+	var factory definedResultFactory = provideValueZero
+	definedRef := component.ProvideValue(factory)
+	managedRef := component.ProvideValue(provideValueZero, component.Managed[*testResult]())
 	rt, err := component.New(definedRef, managedRef)
 	if err != nil {
 		t.Fatalf("New returned an error: %v", err)
@@ -251,13 +251,13 @@ func TestContextNoErrorAdaptersAndMoreThanFourInputs(t *testing.T) {
 	base := component.ProvideContext(func(ctx context.Context) (*testResult, error) {
 		return contextNoError(ctx), nil
 	})
-	adapted := base.MapContext(func(_ context.Context, value *testResult) (*testResult, error) {
+	adapted := component.MapContext(base, func(_ context.Context, value *testResult) (*testResult, error) {
 		return &testResult{value: value.value * 10}, nil
 	})
-	group := component.Value(2).With(component.Value(3)).With(component.Value(5)).Map(
+	group := component.MapValue3(component.Value(2), component.Value(3), component.Value(5),
 		func(first, second, third int) int { return first*100 + second*10 + third },
 	)
-	large := group.With(component.Value(7)).With(component.Value(11)).Map(
+	large := component.MapValue3(group, component.Value(7), component.Value(11),
 		func(grouped, fourth, fifth int) *testResult {
 			return &testResult{value: grouped*1000 + fourth*100 + fifth}
 		},

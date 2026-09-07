@@ -43,7 +43,7 @@ func TestFourInputCompositionPreservesTypedOrder(t *testing.T) {
 	b := component.Value(2)
 	c := component.Value(true)
 	d := component.Value(byte('d'))
-	ref := a.With(b).With(c).With(d).Map(func(gotA string, gotB int, gotC bool, gotD byte) string {
+	ref := component.MapValue4(a, b, c, d, func(gotA string, gotB int, gotC bool, gotD byte) string {
 		return fmt.Sprintf("%s/%d/%t/%c", gotA, gotB, gotC, gotD)
 	})
 
@@ -74,10 +74,10 @@ func TestContextAndErrorConstructorForms(t *testing.T) {
 		seen = ctx
 		return 3, nil
 	})
-	tried := provided.TryMap(func(value int) (string, error) {
+	tried := component.Map(provided, func(value int) (string, error) {
 		return fmt.Sprintf("%d", value), nil
 	})
-	contextMapped := tried.MapContext(func(ctx context.Context, value string) (string, error) {
+	contextMapped := component.MapContext(tried, func(ctx context.Context, value string) (string, error) {
 		if ctx.Value(ctxKey) != "startup" {
 			return "", fmt.Errorf("wrong context")
 		}
@@ -110,7 +110,7 @@ func TestDeepChainUsesIterativeGraphTraversal(t *testing.T) {
 	const depth = 5000
 	ref := component.Value(0)
 	for index := 1; index <= depth; index++ {
-		ref = ref.Map(func(previous int) int { return previous + 1 })
+		ref = component.MapValue(ref, func(previous int) int { return previous + 1 })
 	}
 	rt, err := component.New(ref)
 	if err != nil {
@@ -133,21 +133,21 @@ func TestDeepChainUsesIterativeGraphTraversal(t *testing.T) {
 
 func TestDiamondAndWideGraphsDeduplicateSharedDefinitions(t *testing.T) {
 	var created atomic.Int32
-	base := component.Provide(func() *int {
+	base := component.ProvideValue(func() *int {
 		created.Add(1)
 		value := 9
 		return &value
 	})
-	left := base.Map(func(value *int) int { return *value + 1 })
-	right := base.Map(func(value *int) int { return *value + 2 })
-	diamond := left.With(right).Map(func(first, second int) int { return first + second })
+	left := component.MapValue(base, func(value *int) int { return *value + 1 })
+	right := component.MapValue(base, func(value *int) int { return *value + 2 })
+	diamond := component.MapValue2(left, right, func(first, second int) int { return first + second })
 
 	const width = 128
 	roots := make([]component.Root, 0, width+1)
 	roots = append(roots, diamond)
 	for index := 0; index < width; index++ {
 		offset := index
-		roots = append(roots, base.Map(func(value *int) int { return *value + offset }))
+		roots = append(roots, component.MapValue(base, func(value *int) int { return *value + offset }))
 	}
 	rt, err := component.New(roots...)
 	if err != nil {
@@ -168,9 +168,9 @@ func TestDiamondAndWideGraphsDeduplicateSharedDefinitions(t *testing.T) {
 }
 
 func TestIndependentSameTypeRefsRemainDistinct(t *testing.T) {
-	first := component.Provide(func() int { return 17 })
-	second := component.Provide(func() int { return 23 })
-	combined := first.With(second).Map(func(a, b int) int { return a*100 + b })
+	first := component.ProvideValue(func() int { return 17 })
+	second := component.ProvideValue(func() int { return 23 })
+	combined := component.MapValue2(first, second, func(a, b int) int { return a*100 + b })
 	rt, err := component.New(combined)
 	if err != nil {
 		t.Fatalf("New returned an error")

@@ -17,33 +17,33 @@ func Value[T any](value T) Ref[T] {
 	}}
 }
 
-// Provide declares a no-error, context-free factory.
-func Provide[T any](create func() T, ownership ...Ownership[T]) Ref[T] {
+// ProvideValue declares a context-free factory without an error result.
+func ProvideValue[R any](create func() R, ownership ...Ownership[R]) Ref[R] {
 	if create == nil {
-		return invalidDefinition[T]("Provide requires a non-nil constructor")
+		return invalidDefinition[R]("ProvideValue requires a non-nil constructor")
 	}
-	return newDefinition(nil, func(context.Context, []any) (T, error) {
+	return newDefinition(nil, func(context.Context, []any) (R, error) {
 		return create(), nil
 	}, ownership...)
 }
 
-// TryProvide declares a context-free factory that may fail.
-func TryProvide[T any](create func() (T, error), ownership ...Ownership[T]) Ref[T] {
+// Provide declares a context-free factory that may fail.
+func Provide[R any](create func() (R, error), ownership ...Ownership[R]) Ref[R] {
 	if create == nil {
-		return invalidDefinition[T]("TryProvide requires a non-nil constructor")
+		return invalidDefinition[R]("Provide requires a non-nil constructor")
 	}
-	return newDefinition(nil, func(context.Context, []any) (T, error) {
+	return newDefinition(nil, func(context.Context, []any) (R, error) {
 		return create()
 	}, ownership...)
 }
 
 // ProvideContext declares a factory that receives the caller's startup
 // context and may fail.
-func ProvideContext[T any](create func(context.Context) (T, error), ownership ...Ownership[T]) Ref[T] {
+func ProvideContext[R any](create func(context.Context) (R, error), ownership ...Ownership[R]) Ref[R] {
 	if create == nil {
-		return invalidDefinition[T]("ProvideContext requires a non-nil constructor")
+		return invalidDefinition[R]("ProvideContext requires a non-nil constructor")
 	}
-	return newDefinition(nil, func(ctx context.Context, _ []any) (T, error) {
+	return newDefinition(nil, func(ctx context.Context, _ []any) (R, error) {
 		return create(ctx)
 	}, ownership...)
 }

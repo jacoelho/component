@@ -59,7 +59,7 @@ func requireSentinel(t *testing.T, err, want error) {
 
 func TestDefinitionsDoNotRunFactoriesUntilStart(t *testing.T) {
 	var calls atomic.Int32
-	ref := component.Provide(func() int {
+	ref := component.ProvideValue(func() int {
 		calls.Add(1)
 		return 42
 	})
@@ -81,7 +81,7 @@ func TestDefinitionsDoNotRunFactoriesUntilStart(t *testing.T) {
 
 func TestNewValidatesAllRootsBeforeRunningAnyFactory(t *testing.T) {
 	var calls atomic.Int32
-	valid := component.Provide(func() int {
+	valid := component.ProvideValue(func() int {
 		calls.Add(1)
 		return 7
 	})
@@ -122,15 +122,15 @@ func TestValueIsBorrowedAndFunctionValuesAreNotInvoked(t *testing.T) {
 
 func TestSharedRefsAndRepeatedRootsMaterializeOnce(t *testing.T) {
 	var created, stopped atomic.Int32
-	base := component.Provide(func() *constructionResource {
+	base := component.ProvideValue(func() *constructionResource {
 		created.Add(1)
 		return &constructionResource{id: 17, stopFn: func(context.Context) error {
 			stopped.Add(1)
 			return nil
 		}}
 	}, component.Managed[*constructionResource]())
-	left := base.Map(func(r *constructionResource) int { return r.id + 1 })
-	right := base.Map(func(r *constructionResource) int { return r.id + 2 })
+	left := component.MapValue(base, func(r *constructionResource) int { return r.id + 1 })
+	right := component.MapValue(base, func(r *constructionResource) int { return r.id + 2 })
 
 	rt := newTestRuntime(t, left, right, left)
 	if err := rt.Start(context.Background()); err != nil {
@@ -149,11 +149,11 @@ func TestSharedRefsAndRepeatedRootsMaterializeOnce(t *testing.T) {
 
 func TestUnusedDefinitionsAreNotReachable(t *testing.T) {
 	var used, unused atomic.Int32
-	usedRef := component.Provide(func() int {
+	usedRef := component.ProvideValue(func() int {
 		used.Add(1)
 		return 1
 	})
-	_ = component.Provide(func() int {
+	_ = component.ProvideValue(func() int {
 		unused.Add(1)
 		return 2
 	})
@@ -172,13 +172,13 @@ func TestUnusedDefinitionsAreNotReachable(t *testing.T) {
 
 func TestPureMapPreservesTheOwnedDependencyLifetime(t *testing.T) {
 	var stopped atomic.Int32
-	owner := component.Provide(func() *constructionResource {
+	owner := component.ProvideValue(func() *constructionResource {
 		return &constructionResource{id: 23, stopFn: func(context.Context) error {
 			stopped.Add(1)
 			return nil
 		}}
 	}, component.Managed[*constructionResource]())
-	view := owner.Map(func(r *constructionResource) constructionInterface { return r })
+	view := component.MapValue(owner, func(r *constructionResource) constructionInterface { return r })
 
 	rt := newTestRuntime(t, view)
 	if err := rt.Start(context.Background()); err != nil {
@@ -199,7 +199,7 @@ func TestPureMapPreservesTheOwnedDependencyLifetime(t *testing.T) {
 func TestIndependentRuntimesConstructIndependentOwnedValues(t *testing.T) {
 	var next atomic.Int32
 	var stopped atomic.Int32
-	ref := component.Provide(func() *constructionResource {
+	ref := component.ProvideValue(func() *constructionResource {
 		return &constructionResource{id: int(next.Add(1)), stopFn: func(context.Context) error {
 			stopped.Add(1)
 			return nil
@@ -238,7 +238,7 @@ func TestIndependentRuntimesConstructIndependentOwnedValues(t *testing.T) {
 func TestInputsPreserveArgumentOrderAndRepeatedArguments(t *testing.T) {
 	var calls atomic.Int32
 	input := component.Value(13)
-	ref := input.With(input).Map(func(first, second int) int {
+	ref := component.MapValue2(input, input, func(first, second int) int {
 		calls.Add(1)
 		return first*100 + second
 	})
@@ -263,7 +263,7 @@ func TestInputsPreserveArgumentOrderAndRepeatedArguments(t *testing.T) {
 
 func TestTypedInterfaceValuesAndNilInterfacesRemainValid(t *testing.T) {
 	concrete := component.Value(&constructionResource{id: 31})
-	view := concrete.Map(func(r *constructionResource) constructionInterface { return r })
+	view := component.MapValue(concrete, func(r *constructionResource) constructionInterface { return r })
 	var nilInterface constructionInterface
 	nilRef := component.Value(nilInterface)
 
@@ -308,13 +308,13 @@ func TestTypedNilUnmanagedValuesAreOrdinaryValues(t *testing.T) {
 
 func TestOwnershipValidationHappensAtNew(t *testing.T) {
 	var zero component.Ownership[*constructionResource]
-	withoutOwnership := component.Provide(func() *constructionResource {
+	withoutOwnership := component.ProvideValue(func() *constructionResource {
 		return &constructionResource{}
 	}, zero)
 	_, err := component.New(withoutOwnership)
 	requireSentinel(t, err, component.ErrInvalidDefinition)
 
-	withTwo := component.Provide(func() *constructionResource {
+	withTwo := component.ProvideValue(func() *constructionResource {
 		return &constructionResource{}
 	},
 		component.Managed[*constructionResource](),
@@ -325,14 +325,37 @@ func TestOwnershipValidationHappensAtNew(t *testing.T) {
 }
 
 func TestNilConstructorsAreRejectedBeforeStart(t *testing.T) {
-	var create func() int
-	ref := component.Provide(create)
-	_, err := component.New(ref)
-	requireSentinel(t, err, component.ErrInvalidDefinition)
+	input := component.Value(7)
+	cases := []struct {
+		name string
+		ref  component.Root
+	}{
+		{name: "ProvideValue", ref: component.ProvideValue[int](nil)},
+		{name: "Provide", ref: component.Provide[int](nil)},
+		{name: "ProvideContext", ref: component.ProvideContext[int](nil)},
+		{name: "MapValue", ref: component.MapValue[int](input, nil)},
+		{name: "Map", ref: component.Map[int](input, nil)},
+		{name: "MapContext", ref: component.MapContext[int](input, nil)},
+		{name: "MapValue2", ref: component.MapValue2[int](input, input, nil)},
+		{name: "Map2", ref: component.Map2[int](input, input, nil)},
+		{name: "MapContext2", ref: component.MapContext2[int](input, input, nil)},
+		{name: "MapValue3", ref: component.MapValue3[int](input, input, input, nil)},
+		{name: "Map3", ref: component.Map3[int](input, input, input, nil)},
+		{name: "MapContext3", ref: component.MapContext3[int](input, input, input, nil)},
+		{name: "MapValue4", ref: component.MapValue4[int](input, input, input, input, nil)},
+		{name: "Map4", ref: component.Map4[int](input, input, input, input, nil)},
+		{name: "MapContext4", ref: component.MapContext4[int](input, input, input, input, nil)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := component.New(tc.ref)
+			requireSentinel(t, err, component.ErrInvalidDefinition)
+		})
+	}
 }
 
 func TestManagedNilResultIsRejectedWithoutHooks(t *testing.T) {
-	ref := component.Provide(func() *constructionResource {
+	ref := component.ProvideValue(func() *constructionResource {
 		return nil
 	}, component.Managed[*constructionResource]())
 	rt := newTestRuntime(t, ref)
@@ -381,7 +404,7 @@ func TestRuntimeValueStateAndForeignReferences(t *testing.T) {
 
 func TestRuntimeCopySharesStateAndIdentity(t *testing.T) {
 	var starts, stops atomic.Int32
-	ref := component.Provide(func() *constructionResource {
+	ref := component.ProvideValue(func() *constructionResource {
 		return &constructionResource{id: 5, startFn: func(context.Context) error {
 			starts.Add(1)
 			return nil

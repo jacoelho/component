@@ -2,12 +2,12 @@
 // owned resources in dependency order.
 //
 // References are composition-only values. Value supplies a borrowed value;
-// Provide, TryProvide, and ProvideContext create top-level nodes, while Map,
-// TryMap, and MapContext derive nodes from typed inputs. An Ownership value
-// from Managed declares ownership at the factory that creates a resource.
-// Owned values implement Lifecycle; its Start and Stop methods receive the
-// caller's context. Constructors receive ordinary application values, never a
-// resolver.
+// ProvideValue, Provide, and ProvideContext create top-level nodes, while
+// MapValue, Map, and MapContext, including their 2 through 4 forms, derive
+// nodes from typed inputs. An Ownership value from Managed declares ownership
+// at the factory that creates a resource. Owned values implement Lifecycle;
+// its Start and Stop methods receive the caller's context. Constructors
+// receive ordinary application values, never a resolver.
 //
 // Runtime.Start and Runtime.Stop receive independent caller-created contexts.
 // Runtime runs one node at a time in deterministic dependency order. Start does

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	component "github.com/jacoelho/component"
@@ -83,7 +84,7 @@ func TestManagedChainStartsInDependencyOrderAndStopsInReverse(t *testing.T) {
 		events = append(events, event)
 		mu.Unlock()
 	}
-	dependency := component.Provide(func() *runtimeResource {
+	dependency := component.ProvideValue(func() *runtimeResource {
 		record("dependency.construct")
 		return &runtimeResource{
 			name: "dependency",
@@ -97,7 +98,7 @@ func TestManagedChainStartsInDependencyOrderAndStopsInReverse(t *testing.T) {
 			},
 		}
 	}, component.Managed[*runtimeResource]())
-	dependent := dependency.Map(func(dep *runtimeResource) *runtimeResource {
+	dependent := component.MapValue(dependency, func(dep *runtimeResource) *runtimeResource {
 		record("dependent.construct")
 		return &runtimeResource{
 			name: dep.name + ".child",
@@ -141,47 +142,95 @@ func TestManagedChainStartsInDependencyOrderAndStopsInReverse(t *testing.T) {
 }
 
 func TestIndependentNodesStartSeriallyAndStopInReverse(t *testing.T) {
-	var mu sync.Mutex
-	var events []string
-	record := func(event string) {
-		mu.Lock()
-		defer mu.Unlock()
-		events = append(events, event)
-	}
-	resource := func(name string) component.Ref[*runtimeResource] {
-		return component.Provide(func() *runtimeResource {
-			record(name + ".construct")
-			return &runtimeResource{
-				startFn: func(context.Context) error { record(name + ".start"); return nil },
-				stopFn:  func(context.Context) error { record(name + ".stop"); return nil },
+	synctest.Test(t, func(t *testing.T) {
+		entered := make(chan string, 6)
+		release := make(chan struct{})
+		t.Cleanup(func() { close(release) })
+		dispatch := func(name string) {
+			entered <- name
+			<-release
+		}
+		resource := func(name string) component.Ref[*runtimeResource] {
+			return component.ProvideValue(func() *runtimeResource {
+				dispatch(name + ".construct")
+				return &runtimeResource{
+					startFn: func(context.Context) error {
+						dispatch(name + ".start")
+						return nil
+					},
+					stopFn: func(context.Context) error {
+						dispatch(name + ".stop")
+						return nil
+					},
+				}
+			}, component.Managed[*runtimeResource]())
+		}
+		rt := newTestRuntime(t, resource("a"), resource("b"))
+		next := func() string {
+			synctest.Wait()
+			if got := len(entered); got != 1 {
+				t.Fatalf("callbacks entered concurrently: queued=%d", got)
 			}
-		}, component.Managed[*runtimeResource]())
-	}
-	rt := newTestRuntime(t, resource("a"), resource("b"))
-	if err := rt.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := rt.Stop(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got, want := strings.Join(events, ","), "a.construct,a.start,b.construct,b.start,b.stop,a.stop"; got != want {
-		t.Fatalf("lifecycle order = %s, want %s", got, want)
-	}
+			name := <-entered
+			release <- struct{}{}
+			return name
+		}
+		startResult := make(chan error, 1)
+		go func() { startResult <- rt.Start(context.Background()) }()
+		constructA := next()
+		startA := next()
+		constructB := next()
+		startB := next()
+		synctest.Wait()
+		if err := <-startResult; err != nil {
+			t.Fatalf("Start returned an error: %v", err)
+		}
+
+		phaseName := func(event, wantPhase string) string {
+			name, phase, ok := strings.Cut(event, ".")
+			if !ok || phase != wantPhase {
+				t.Fatalf("event=%q, want phase %q", event, wantPhase)
+			}
+			return name
+		}
+		constructNameA := phaseName(constructA, "construct")
+		startNameA := phaseName(startA, "start")
+		constructNameB := phaseName(constructB, "construct")
+		startNameB := phaseName(startB, "start")
+		if constructNameA != startNameA || constructNameB != startNameB {
+			t.Fatalf("construct/start names = %q/%q and %q/%q", constructNameA, startNameA, constructNameB, startNameB)
+		}
+		if constructNameA == constructNameB {
+			t.Fatalf("only one independent node dispatched: %q", constructNameA)
+		}
+
+		stopResult := make(chan error, 1)
+		go func() { stopResult <- rt.Stop(context.Background()) }()
+		stopA := phaseName(next(), "stop")
+		stopB := phaseName(next(), "stop")
+		synctest.Wait()
+		if err := <-stopResult; err != nil {
+			t.Fatalf("Stop returned an error: %v", err)
+		}
+		if stopA != startNameB || stopB != startNameA {
+			t.Fatalf("stop order=%q,%q; startup order=%q,%q", stopA, stopB, startNameA, startNameB)
+		}
+	})
 }
 
 func TestFailedStartRetainsSuccessfulOwnershipForCallerStop(t *testing.T) {
 	startFailure := errors.New("sibling construction failed")
 	var sourceStops, laterCalls atomic.Int32
-	source := component.Provide(func() *runtimeResource {
+	source := component.ProvideValue(func() *runtimeResource {
 		return &runtimeResource{name: "source", stopFn: func(context.Context) error {
 			sourceStops.Add(1)
 			return nil
 		}}
 	}, component.Managed[*runtimeResource]())
-	failing := component.TryProvide(func() (*runtimeResource, error) {
+	failing := component.Provide(func() (*runtimeResource, error) {
 		return nil, startFailure
 	})
-	later := component.Provide(func() int {
+	later := component.ProvideValue(func() int {
 		laterCalls.Add(1)
 		return 1
 	})
@@ -206,7 +255,7 @@ func TestFailedStartRetainsSuccessfulOwnershipForCallerStop(t *testing.T) {
 func TestStartHookFailureTransfersOwnershipBeforeCallingTheHook(t *testing.T) {
 	startFailure := errors.New("start hook failed")
 	var starts, stops atomic.Int32
-	ref := component.Provide(func() *runtimeResource {
+	ref := component.ProvideValue(func() *runtimeResource {
 		return &runtimeResource{
 			name: "owned",
 			startFn: func(context.Context) error {
@@ -237,7 +286,7 @@ func TestStartHookFailureTransfersOwnershipBeforeCallingTheHook(t *testing.T) {
 func TestConstructorValueAndErrorDoesNotTransferOwnership(t *testing.T) {
 	constructionFailure := errors.New("constructor failed after a value")
 	var starts, stops atomic.Int32
-	ref := component.TryProvide(func() (*runtimeResource, error) {
+	ref := component.Provide(func() (*runtimeResource, error) {
 		return &runtimeResource{
 			name: "discarded",
 			startFn: func(context.Context) error {
@@ -264,7 +313,7 @@ func TestConstructorValueAndErrorDoesNotTransferOwnership(t *testing.T) {
 
 func TestStartPanicPreservesConstructedOwnershipAndStack(t *testing.T) {
 	var stops atomic.Int32
-	ref := component.Provide(func() *runtimeResource {
+	ref := component.ProvideValue(func() *runtimeResource {
 		return &runtimeResource{
 			name: "panic-owner",
 			startFn: func(context.Context) error {
@@ -298,7 +347,7 @@ func TestStartPanicPreservesConstructedOwnershipAndStack(t *testing.T) {
 }
 
 func TestConstructorPanicReportsConstructPhase(t *testing.T) {
-	ref := component.Provide(func() *runtimeResource {
+	ref := component.ProvideValue(func() *runtimeResource {
 		panic("construct panic payload")
 	})
 	rt := newTestRuntime(t, ref)
@@ -318,7 +367,7 @@ func TestConstructorPanicReportsConstructPhase(t *testing.T) {
 
 func TestStartGoexitPreservesConstructedOwnership(t *testing.T) {
 	var stops atomic.Int32
-	ref := component.Provide(func() *runtimeResource {
+	ref := component.ProvideValue(func() *runtimeResource {
 		return &runtimeResource{
 			name: "goexit-owner",
 			startFn: func(context.Context) error {
@@ -349,16 +398,16 @@ func TestStartGoexitPreservesConstructedOwnership(t *testing.T) {
 func TestFailedStopLeavesNodePendingAndRetainsDependency(t *testing.T) {
 	stopFailure := errors.New("child stop failed")
 	var childStops, dependencyStops atomic.Int32
-	dependency := component.Provide(func() *runtimeResource {
+	dependency := component.ProvideValue(func() *runtimeResource {
 		return &runtimeResource{name: "dependency", stopFn: func(context.Context) error {
 			dependencyStops.Add(1)
 			return nil
 		}}
 	}, component.Managed[*runtimeResource]())
-	alias := dependency.Map(func(*runtimeResource) *runtimeResource {
+	alias := component.MapValue(dependency, func(*runtimeResource) *runtimeResource {
 		return &runtimeResource{name: "alias"}
 	})
-	child := alias.Map(func(*runtimeResource) *runtimeResource {
+	child := component.MapValue(alias, func(*runtimeResource) *runtimeResource {
 		return &runtimeResource{name: "child", stopFn: func(context.Context) error {
 			if childStops.Add(1) == 1 {
 				return stopFailure
@@ -395,7 +444,7 @@ func TestFailedStopLeavesNodePendingAndRetainsDependency(t *testing.T) {
 func TestFailedStopContinuesUnrelatedCleanup(t *testing.T) {
 	stopFailure := errors.New("branch A stop failed")
 	var aStops, bStops atomic.Int32
-	a := component.Provide(func() *runtimeResource {
+	a := component.ProvideValue(func() *runtimeResource {
 		return &runtimeResource{name: "a", stopFn: func(context.Context) error {
 			if aStops.Add(1) == 1 {
 				return stopFailure
@@ -403,7 +452,7 @@ func TestFailedStopContinuesUnrelatedCleanup(t *testing.T) {
 			return nil
 		}}
 	}, component.Managed[*runtimeResource]())
-	b := component.Provide(func() *runtimeResource {
+	b := component.ProvideValue(func() *runtimeResource {
 		return &runtimeResource{name: "b", stopFn: func(context.Context) error {
 			bStops.Add(1)
 			return nil
@@ -432,7 +481,7 @@ func TestFailedStopContinuesUnrelatedCleanup(t *testing.T) {
 func TestStopPanicAndGoexitRemainPending(t *testing.T) {
 	t.Run("panic", func(t *testing.T) {
 		var calls atomic.Int32
-		ref := component.Provide(func() *runtimeResource {
+		ref := component.ProvideValue(func() *runtimeResource {
 			return &runtimeResource{name: "panic-stop", stopFn: func(context.Context) error {
 				if calls.Add(1) == 1 {
 					panic("stop panic payload")
@@ -458,7 +507,7 @@ func TestStopPanicAndGoexitRemainPending(t *testing.T) {
 
 	t.Run("goexit", func(t *testing.T) {
 		var calls atomic.Int32
-		ref := component.Provide(func() *runtimeResource {
+		ref := component.ProvideValue(func() *runtimeResource {
 			return &runtimeResource{name: "goexit-stop", stopFn: func(context.Context) error {
 				if calls.Add(1) == 1 {
 					runtime.Goexit()
@@ -514,7 +563,7 @@ func TestExactContextsReachFactoriesAndHooks(t *testing.T) {
 
 func TestNilContextsDoNotChangeRuntimeState(t *testing.T) {
 	var creates, stops atomic.Int32
-	ref := component.Provide(func() *runtimeResource {
+	ref := component.ProvideValue(func() *runtimeResource {
 		creates.Add(1)
 		return &runtimeResource{name: "nil-context", stopFn: func(context.Context) error {
 			stops.Add(1)
@@ -542,7 +591,7 @@ func TestNilContextsDoNotChangeRuntimeState(t *testing.T) {
 
 func TestCanceledStartConsumesTheOnlyStartAttempt(t *testing.T) {
 	var creates atomic.Int32
-	ref := component.Provide(func() int {
+	ref := component.ProvideValue(func() int {
 		creates.Add(1)
 		return 1
 	})
@@ -601,7 +650,7 @@ func TestCanceledStopWaitsForInFlightCallbackAndRetainsContext(t *testing.T) {
 	var calls atomic.Int32
 	var observedCanceled atomic.Bool
 	ancestor := component.Value(7)
-	ref := ancestor.Map(func(int) *runtimeResource {
+	ref := component.MapValue(ancestor, func(int) *runtimeResource {
 		return &runtimeResource{name: "stop-context", stopFn: func(ctx context.Context) error {
 			// The callback is released only after the caller cancels its context.
 			calls.Add(1)
@@ -652,7 +701,7 @@ func TestCanceledStopDrainsAnAllPureGraph(t *testing.T) {
 
 func TestCanceledStopBeforeDispatchLeavesCleanupForRetry(t *testing.T) {
 	var stops atomic.Int32
-	ref := component.Provide(func() *runtimeResource {
+	ref := component.ProvideValue(func() *runtimeResource {
 		return &runtimeResource{name: "late-stop", stopFn: func(context.Context) error {
 			stops.Add(1)
 			return nil
@@ -682,7 +731,7 @@ func TestCanceledStopBeforeDispatchLeavesCleanupForRetry(t *testing.T) {
 func TestOverlappingStartAndStopAreBusy(t *testing.T) {
 	entered := make(chan struct{})
 	release, releaseOnce := makeRelease(t)
-	ref := component.Provide(func() int {
+	ref := component.ProvideValue(func() int {
 		close(entered)
 		<-release
 		return 1
@@ -704,7 +753,7 @@ func TestOverlappingStartAndStopAreBusy(t *testing.T) {
 func TestOverlappingStopsAreBusy(t *testing.T) {
 	entered := make(chan struct{})
 	release, releaseOnce := makeRelease(t)
-	ref := component.Provide(func() *runtimeResource {
+	ref := component.ProvideValue(func() *runtimeResource {
 		return &runtimeResource{name: "overlap-stop", stopFn: func(context.Context) error {
 			close(entered)
 			<-release
@@ -767,7 +816,7 @@ func (*hostileCause) Unwrap() error {
 
 func TestSchedulerDoesNotFormatOrClassifyUserErrors(t *testing.T) {
 	t.Run("panic Error", func(t *testing.T) {
-		ref := component.TryProvide(func() (int, error) { return 0, &panicError{} })
+		ref := component.Provide(func() (int, error) { return 0, &panicError{} })
 		rt := newTestRuntime(t, ref)
 		err := rt.Start(context.Background())
 		ne := nodeError(t, err)
@@ -779,7 +828,7 @@ func TestSchedulerDoesNotFormatOrClassifyUserErrors(t *testing.T) {
 	t.Run("blocking Error", func(t *testing.T) {
 		release, releaseOnce := makeRelease(t)
 		hostile := &blockingError{entered: make(chan struct{}), release: release}
-		ref := component.TryProvide(func() (int, error) { return 0, hostile })
+		ref := component.Provide(func() (int, error) { return 0, hostile })
 		rt := newTestRuntime(t, ref)
 		result := make(chan error, 1)
 		go func() { result <- rt.Start(context.Background()) }()
@@ -803,7 +852,7 @@ func TestSchedulerDoesNotFormatOrClassifyUserErrors(t *testing.T) {
 
 	t.Run("Goexit Error", func(t *testing.T) {
 		hostile := &goexitError{}
-		ref := component.TryProvide(func() (int, error) { return 0, hostile })
+		ref := component.Provide(func() (int, error) { return 0, hostile })
 		rt := newTestRuntime(t, ref)
 		result := make(chan error, 1)
 		go func() { result <- rt.Start(context.Background()) }()
@@ -822,7 +871,7 @@ func TestSchedulerDoesNotFormatOrClassifyUserErrors(t *testing.T) {
 
 	t.Run("hostile classifiers", func(t *testing.T) {
 		cause := &hostileCause{}
-		ref := component.TryProvide(func() (int, error) { return 0, cause })
+		ref := component.Provide(func() (int, error) { return 0, cause })
 		rt := newTestRuntime(t, ref)
 		err := rt.Start(context.Background())
 		ne := nodeError(t, err)
@@ -834,7 +883,7 @@ func TestSchedulerDoesNotFormatOrClassifyUserErrors(t *testing.T) {
 
 func TestConstructorGoexitLeavesPartialCleanupWithFactory(t *testing.T) {
 	var localCleanup atomic.Int32
-	ref := component.Provide(func() *runtimeResource {
+	ref := component.ProvideValue(func() *runtimeResource {
 		defer localCleanup.Add(1)
 		runtime.Goexit()
 		return nil
@@ -869,7 +918,7 @@ func TestEmptyRuntimeAndStopBeforeStartRemainOneShot(t *testing.T) {
 	})
 	t.Run("stop before start", func(t *testing.T) {
 		var calls atomic.Int32
-		ref := component.Provide(func() int { calls.Add(1); return 7 })
+		ref := component.ProvideValue(func() int { calls.Add(1); return 7 })
 		rt := newTestRuntime(t, ref)
 		if err := rt.Stop(t.Context()); err != nil {
 			t.Fatal(err)
