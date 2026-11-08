@@ -6,33 +6,37 @@ import (
 	"github.com/jacoelho/component"
 )
 
-// Construction of definitions is outside the measurement: these benchmarks
-// isolate per-runtime graph validation and compilation, without user I/O.
-func BenchmarkNew(b *testing.B) {
-	const size = 1000
-	b.Run("chain", func(b *testing.B) {
-		root := component.Value(0)
-		for range size {
-			root = component.MapValue(root, func(value int) int { return value + 1 })
+// BenchmarkNewStartStop measures one App lifecycle over a layered graph in
+// which every node depends on two nodes of the previous layer.
+func BenchmarkNewStartStop(b *testing.B) {
+	const layers, width = 50, 20
+	prev := make([]component.Ref[int], width)
+	for i := range prev {
+		prev[i] = component.Value(i)
+	}
+	for range layers {
+		next := make([]component.Ref[int], width)
+		for i := range next {
+			next[i] = component.MapValue2(prev[i], prev[(i+1)%width], func(a, b int) int { return a + b })
 		}
-		b.ReportAllocs()
-		for b.Loop() {
-			if _, err := component.New(root); err != nil {
-				b.Fatal(err)
-			}
+		prev = next
+	}
+	roots := make([]component.Root, width)
+	for i, r := range prev {
+		roots[i] = r
+	}
+	ctx := b.Context()
+	b.ReportAllocs()
+	for b.Loop() {
+		app, err := component.New(ctx, roots)
+		if err != nil {
+			b.Fatal(err)
 		}
-	})
-	b.Run("wide", func(b *testing.B) {
-		source := component.Value(0)
-		roots := make([]component.Root, size)
-		for index := range roots {
-			roots[index] = component.MapValue(source, func(value int) int { return value + 1 })
+		if err := app.Start(ctx); err != nil {
+			b.Fatal(err)
 		}
-		b.ReportAllocs()
-		for b.Loop() {
-			if _, err := component.New(roots...); err != nil {
-				b.Fatal(err)
-			}
+		if err := app.Stop(ctx); err != nil {
+			b.Fatal(err)
 		}
-	})
+	}
 }
