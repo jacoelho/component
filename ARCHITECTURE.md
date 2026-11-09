@@ -62,6 +62,30 @@ before any of them. Nodes with no path between them have no guaranteed
 relative order; the current order (first reach from the roots) is
 deterministic but not part of the contract.
 
+### State
+
+Lifecycle state has three owners, all in `app.go`. Each is one enum that only
+advances; no other field encodes lifecycle.
+
+| State | Values | Guard | Changed by |
+|-------|--------|-------|------------|
+| `appState`, per App | `appBuilt` → `appStarting` → `appStarted`; any → `appStopping` (final) | `mu` | `beginStart`, `endStart`, `beginStop` |
+| `nodeState`, per node | `nodePending` → `nodeBuilt` → `nodeBegun` | `op`, or `New` before the App is shared | `New` (a replaced node is born built), `build`, `startNode` |
+| `exitClaim`, per App | `unclaimed` → `claimedByWait` or `claimedByStop` | `mu` | `reportExit`, `claimForStop` |
+
+- `appState` decides what `Start`, `Get` and `Wait` return and whether a task
+  exit is Wait's or Stop's to report. `stopStart` is set exactly while the
+  state is `appStarting`, and `stopBegun` is closed by the move to
+  `appStopping`.
+- `nodeState` decides what Stop owes a node: nothing when pending, `OnClose`
+  when built, and also `OnDrain` and `OnStop` when begun.
+- There is no stopped state. Teardown runs once per App, so nothing needs to
+  ask whether a node or the App has finished stopping.
+
+Two smaller pieces of state stay where they are because they have one writer
+and no policy: a task is running until its `done` channel closes, and `Serve`
+holds its listener in a per-App closure from listen to shutdown.
+
 ### New
 
 1. Collects every declaration error before any constructor runs: zero or nil
@@ -82,8 +106,8 @@ deterministic but not part of the contract.
 ### Start
 
 Runs nodes serially in build order: each node's `OnStart` hooks in option
-order, then its `Go` tasks. A node's start has *begun* once its first hook is
-about to run; this flag decides which teardown hooks apply. Tasks get one
+order, then its `Go` tasks. A node is *begun* (`nodeBegun`) once its first hook
+is about to run; this decides which teardown hooks apply. Tasks get one
 context per node, made with `context.WithoutCancel(startCtx)` and cancelled
 only at that node's turn in Stop. Start stops at the first failure or when its
 context is done, does not roll back, and leaves cleanup to Stop.
@@ -125,16 +149,18 @@ not stopped or drained.
 
 - At most one constructor or hook runs at a time. Each task is one goroutine
   owned by the `App` and joined, or reported abandoned, in Stop.
-- `op` serialises `Start` and Stop's teardown. A Stop issued during Start
-  marks the App stopping at once (so `Get` and `Wait` see it, and Start
-  dispatches no further node), cancels Start's context with `ErrStopped`,
-  and tears down after the running hook returns. A hook that ignores its
+- `op` serialises `Start` and Stop's teardown. Start registers its cancel
+  function in the same step that enters `appStarting`, so a Stop either comes
+  first and Start returns `ErrStopped`, or comes later and cancels it. A Stop
+  issued during Start marks the App stopping at once (so `Get` and `Wait` see
+  it), cancels Start's context with `ErrStopped` (so Start dispatches no
+  further node), and tears down after the running hook returns. A hook that ignores its
   context therefore delays Stop past its deadline.
 - Calling `Stop` or `Start` from a hook or task of the same App deadlocks:
   Start holds `op`, Stop's `sync.Once` is not re-entrant, and teardown waits
   for the calling task. A task asks for shutdown by returning; Wait reports
   it.
-- `mu` guards the stopping flag and the first task exit. Values are written
+- `mu` guards `appState` and the first task exit. Values are written
   only during `New`, so `Get` reads them without locking.
 - Panics in constructors, hooks and tasks are recovered into `*PanicError`.
   `runtime.Goexit` in a constructor or hook is not intercepted: it ends the
