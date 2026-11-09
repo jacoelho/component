@@ -115,14 +115,15 @@ func runService() (err error) {
 	}, component.Serve())
 
 	app, err := component.New(ctx, []component.Root{srv})
-	if err != nil {
-		return err // New has already stopped what it built
-	}
+	// Stop also cleans up after a failed New or Start, so defer it first.
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		err = errors.Join(err, app.Stop(stopCtx))
 	}()
+	if err != nil {
+		return err
+	}
 	if err := app.Start(ctx); err != nil {
 		return err
 	}

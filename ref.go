@@ -121,22 +121,25 @@ func declare[R any](label string, inputs []edge, build func(context.Context, []a
 			return v, nil
 		},
 	}
+	// Every invalid option is reported, not only the last.
+	var errs []error
 	labelled := false
 	for _, opt := range opts {
 		switch {
 		case opt.err != nil:
-			n.err = opt.err
+			errs = append(errs, opt.err)
 		case opt.label != "":
 			if labelled {
-				n.err = fmt.Errorf("%w: more than one Label", ErrInvalidDefinition)
+				errs = append(errs, fmt.Errorf("%w: more than one Label", ErrInvalidDefinition))
 			}
 			n.label, labelled = opt.label, true
 		case opt.hooks != nil:
 			n.options = append(n.options, opt.hooks)
 		default:
-			n.err = fmt.Errorf("%w: zero Option", ErrInvalidDefinition)
+			errs = append(errs, fmt.Errorf("%w: zero Option", ErrInvalidDefinition))
 		}
 	}
+	n.err = errors.Join(errs...)
 	return Ref[R]{node: n}
 }
 
@@ -149,13 +152,18 @@ func invalid[R any](name string, inputs []edge, opts []Option[R]) Ref[R] {
 }
 
 // as recovers a value stored as any. A nil interface value is stored as a nil
-// any, which the unchecked assertion turns back into the nil T.
+// any and comes back as the nil T. Any other mismatch is a bug in this
+// package, so the assertion panics instead of handing out a zero value.
 func as[T any](v any) T {
-	if t, ok := v.(T); ok {
-		return t
+	if v == nil {
+		var zero T
+		return zero
 	}
-	var zero T
-	return zero
+	t, ok := v.(T)
+	if !ok {
+		panic(fmt.Sprintf("component: internal error: stored %T where %s was declared", v, reflect.TypeFor[T]()))
+	}
+	return t
 }
 
 // funcLabel names a constructor by its function, without the import path:

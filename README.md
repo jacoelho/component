@@ -75,14 +75,15 @@ func runService() (err error) {
 	}, component.Serve())
 
 	app, err := component.New(ctx, []component.Root{srv})
-	if err != nil {
-		return err // New has already stopped what it built
-	}
+	// Stop also cleans up after a failed New or Start, so defer it first.
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		err = errors.Join(err, app.Stop(stopCtx))
 	}()
+	if err != nil {
+		return err
+	}
 	if err := app.Start(ctx); err != nil {
 		return err
 	}
@@ -93,8 +94,9 @@ func runService() (err error) {
 }
 ```
 
-Call `Stop` even when `Start` fails: `Start` does not roll back what it
-started. The library installs no signal handlers and sets no timeouts; every
+Call `Stop` even when `New` or `Start` fails: neither rolls back what it
+built or started, and `New` always returns an App to stop. Deferring `Stop`
+before checking `New`'s error keeps every path covered. The library installs no signal handlers and sets no timeouts; every
 deadline comes from a context you pass.
 
 `Serve` listens on `Addr` during `Start`, so an address already in use fails
@@ -136,8 +138,8 @@ decides how it starts and stops:
 | --- | --- |
 | `OnStart(f)` | during `Start`, after every dependency has started |
 | `Go(f)` | as a goroutine after the node's start hooks succeed; its context is cancelled at the node's turn in `Stop` |
-| `OnDrain(f)` | at the beginning of `Stop`, before anything stops, if the node's start ran |
-| `OnStop(f)` | during `Stop`, if the node's start ran |
+| `OnDrain(f)` | at the beginning of `Stop`, before anything stops, if the node's start began |
+| `OnStop(f)` | during `Stop`, if the node's start began |
 | `OnClose(f)` | during `Stop`, for every built node, started or not |
 | `Serve()` | listen, serve and shut down an `*http.Server` |
 | `Label(name)` | names the node in errors and `Plan`; the default is the constructor's function name |
@@ -146,6 +148,9 @@ decides how it starts and stops:
 which fits method expressions such as `(*sql.DB).PingContext`. `OnClose` takes
 `func(T) error`, which fits `(*sql.DB).Close`. A hook for the wrong type does
 not compile.
+
+A node's start has begun once `Start` reaches it, even if one of its start
+hooks then fails, so stop and drain hooks must tolerate a failed start.
 
 A node's start hooks run in option order. Its stop and close hooks run in
 reverse option order, like deferred calls.
@@ -217,7 +222,8 @@ fmt.Println(w.store.dsn) // memory
 The replacement is type-checked against the ref. `Get` reads any node's value
 from a successful `New` until `Stop` begins. To test part of a graph, pass
 only its refs as roots. `Plan` lists every node's label and dependencies in
-start order.
+build order: each node after its dependencies. `Stop` runs that order in
+reverse.
 
 ## Shutdown and errors
 
@@ -236,8 +242,10 @@ for the running hook to return. Do not call `Stop` or `Start` from a hook or a
 task of the same App, because it deadlocks. A task that wants the App to stop
 returns instead, and `Wait` reports it.
 
-If a constructor fails or panics, `New` stops what it has built and returns a
-nil App. Every failure is a `*NodeError` carrying the node's label and phase,
+If a declaration is invalid, or a constructor fails or panics, `New` stops
+building and returns the error with a failed App. `Start`, `Wait` and `Get`
+on it return `ErrBuildFailed`; `Stop` closes what was built and stops what a
+`Started` input had started, within the stop context. Every node failure is a `*NodeError` carrying the node's label and `Phase`,
 and the original error stays reachable with `errors.Is` and `errors.As`.
 Panics become a `*PanicError` with the stack.
 
