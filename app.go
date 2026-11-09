@@ -15,23 +15,36 @@ import (
 type App struct {
 	stopErr   error
 	index     map[*node]int
-	stopBegun chan struct{}
+	stopBegun chan struct{} // closed by the transition to appStopping
 	exited    chan struct{}
 	exitTask  *task                   // guarded by mu
-	stopStart context.CancelCauseFunc // guarded by mu; cancels a running Start
+	stopStart context.CancelCauseFunc // guarded by mu; set only while appStarting
 	nodes     []*instance
 	// op serialises Start and Stop's teardown, so Stop waits for a running
-	// Start to return. Start checks for Stop between nodes.
+	// Start to return.
 	op sync.Mutex
-	// mu guards exitTask, stopStart, stopping and exitClaim.
-	mu          sync.Mutex
-	stopOnce    sync.Once
-	startCalled bool
-	stopping    bool
+	// mu guards state, stopStart, exitTask and exitClaim.
+	mu       sync.Mutex
+	stopOnce sync.Once
+	// state changes only in beginStart, endStart and beginStop.
+	state appState
 	// exitClaim records whether Wait or Stop reported the first task exit,
 	// so exactly one of them returns it.
 	exitClaim exitClaim
 }
+
+// appState is the App's lifecycle. It only advances:
+//
+//	appBuilt -> appStarting -> appStarted
+//	any of them -> appStopping
+type appState uint8
+
+const (
+	appBuilt    appState = iota // New built every node; Start has not been called
+	appStarting                 // Start is dispatching nodes; stopStart cancels it
+	appStarted                  // Start returned, with or without an error
+	appStopping                 // Stop began; final
+)
 
 type exitClaim uint8
 
@@ -43,17 +56,25 @@ const (
 
 // instance is a node's state within one App.
 type instance struct {
-	value    any
-	decl     *node
-	cancel   context.CancelFunc
-	label    string
-	deps     []int
-	hooks    []hook
-	tasks    []*task
-	built    bool
-	replaced bool
-	began    bool // start ran, even if it failed
+	value  any
+	decl   *node
+	cancel context.CancelFunc
+	label  string
+	deps   []int
+	hooks  []hook
+	tasks  []*task
+	state  nodeState
 }
+
+// nodeState is how far a node has come within one App. It only advances, and
+// it decides which teardown hooks Stop owes the node.
+type nodeState uint8
+
+const (
+	nodePending nodeState = iota // no value and no hooks; Stop owes nothing
+	nodeBuilt                    // has a value; Stop owes OnClose
+	nodeBegun                    // start began, even if it failed; Stop also owes OnDrain and OnStop
+)
 
 type task struct {
 	done chan struct{}
@@ -114,7 +135,8 @@ func New(ctx context.Context, roots []Root, opts ...AppOption) (*App, error) {
 	for i, n := range order {
 		inst := &instance{decl: n, label: n.label}
 		if v, ok := replace[n]; ok {
-			inst.replaced, inst.value = true, v
+			// A replaced node is born built, with no inputs and no hooks.
+			inst.value, inst.state = v, nodeBuilt
 		} else {
 			for _, e := range n.inputs {
 				inst.deps = append(inst.deps, index[e.node])
@@ -201,9 +223,8 @@ func sortGraph(roots []Root, replace map[*node]any) ([]*node, map[*node]int, []e
 
 func (a *App) build(ctx context.Context, i int) error {
 	inst := a.nodes[i]
-	if inst.replaced {
-		inst.built = true
-		return nil
+	if inst.state != nodePending {
+		return nil // replaced
 	}
 	for j, e := range inst.decl.inputs {
 		if e.started {
@@ -220,7 +241,7 @@ func (a *App) build(ctx context.Context, i int) error {
 	if err != nil {
 		return &NodeError{Label: inst.label, Phase: PhaseBuild, Err: err}
 	}
-	inst.value, inst.built = v, true
+	inst.value, inst.state = v, nodeBuilt
 	for _, produce := range inst.decl.options {
 		inst.hooks = append(inst.hooks, produce()...)
 	}
@@ -246,7 +267,7 @@ func (a *App) startClosure(ctx context.Context, i int) error {
 	for len(stack) != 0 {
 		n := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		if a.nodes[n].began {
+		if a.nodes[n].state == nodeBegun {
 			continue
 		}
 		pending = append(pending, n)
@@ -278,32 +299,19 @@ func (a *App) startClosure(ctx context.Context, i int) error {
 func (a *App) Start(ctx context.Context) error {
 	a.op.Lock()
 	defer a.op.Unlock()
-	if a.isStopping() {
-		return ErrStopped
-	}
-	if a.startCalled {
-		return ErrStarted
-	}
-	a.startCalled = true
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	a.mu.Lock()
-	a.stopStart = cancel
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		a.stopStart = nil
-		a.mu.Unlock()
-	}()
+	if err := a.beginStart(cancel); err != nil {
+		return err
+	}
+	defer a.endStart()
 	for i, inst := range a.nodes {
-		if inst.began {
+		if inst.state == nodeBegun {
 			continue
 		}
-		if err := ctx.Err(); err != nil {
+		// A Stop issued since beginStart has cancelled ctx with ErrStopped.
+		if ctx.Err() != nil {
 			return &NodeError{Label: inst.label, Phase: PhaseStart, Err: context.Cause(ctx)}
-		}
-		if a.isStopping() {
-			return ErrStopped
 		}
 		if err := a.startNode(ctx, i); err != nil {
 			return err
@@ -312,9 +320,36 @@ func (a *App) Start(ctx context.Context) error {
 	return nil
 }
 
+// beginStart moves appBuilt to appStarting and registers cancel in the same
+// step, so a Stop either precedes the start and rejects it, or follows it and
+// cancels it.
+func (a *App) beginStart(cancel context.CancelCauseFunc) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	switch a.state {
+	case appBuilt:
+		a.state, a.stopStart = appStarting, cancel
+		return nil
+	case appStopping:
+		return ErrStopped
+	default:
+		return ErrStarted
+	}
+}
+
+// endStart moves appStarting to appStarted, unless Stop began meanwhile.
+func (a *App) endStart() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stopStart = nil
+	if a.state == appStarting {
+		a.state = appStarted
+	}
+}
+
 func (a *App) startNode(ctx context.Context, i int) error {
 	inst := a.nodes[i]
-	inst.began = true
+	inst.state = nodeBegun
 	for _, h := range inst.hooks {
 		if h.kind != hookStart {
 			continue
@@ -359,7 +394,7 @@ var errGoexit = fmt.Errorf("%w: runtime.Goexit", ErrExited)
 func (a *App) recordExit(ctx context.Context, label string, t *task, err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if !a.stopping {
+	if a.state != appStopping {
 		if err == nil {
 			err = ErrExited
 		}
@@ -437,26 +472,30 @@ func (a *App) Stop(ctx context.Context) error {
 	return a.stopErr
 }
 
+// beginStop moves any state to appStopping, cancelling a running Start. Each
+// App reaches it once: through Stop's sync.Once, or in New before the App is
+// returned.
 func (a *App) beginStop() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.stopping = true
-	close(a.stopBegun)
-	if a.stopStart != nil {
+	if a.state == appStarting {
 		a.stopStart(ErrStopped)
+		a.stopStart = nil
 	}
+	a.state = appStopping
+	close(a.stopBegun)
 }
 
 func (a *App) isStopping() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.stopping
+	return a.state == appStopping
 }
 
 func (a *App) teardown(ctx context.Context) error {
 	var errs []error
 	for _, inst := range slices.Backward(a.nodes) {
-		if !inst.began {
+		if inst.state != nodeBegun {
 			continue
 		}
 		for _, h := range slices.Backward(inst.hooks) {
@@ -469,14 +508,14 @@ func (a *App) teardown(ctx context.Context) error {
 	}
 	abandoned := false
 	for _, inst := range slices.Backward(a.nodes) {
-		if !inst.built {
+		if inst.state == nodePending {
 			continue
 		}
 		if inst.cancel != nil {
 			inst.cancel()
 		}
 		for _, h := range slices.Backward(inst.hooks) {
-			if h.kind == hookClose || (h.kind == hookStop && inst.began) {
+			if h.kind == hookClose || (h.kind == hookStop && inst.state == nodeBegun) {
 				if err := call(ctx, h.run, inst.value); err != nil {
 					errs = append(errs, &NodeError{Label: inst.label, Phase: PhaseStop, Err: err})
 				}
