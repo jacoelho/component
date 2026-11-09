@@ -1,12 +1,13 @@
 # Component
 
-`component` builds a typed construction graph and runs its owned resources in
-deterministic dependency order. A dependency is ready before a dependent
-starts, and a dependent has finished stopping before its dependency is stopped.
+`component` wires a Go application as a typed graph of constructors and runs
+it. It builds each value once, starts values after the values they depend on,
+and stops them in reverse order. The compiler checks every dependency and
+every lifecycle hook, without reflection or string keys.
 
-The graph is ordinary Go code. Constructors receive ordinary values, so the
-application keeps its own types, interfaces, closures, and resource policies.
-References exist only in composition code.
+Constructors stay ordinary Go functions, and lifecycle methods attach as
+method expressions such as `(*sql.DB).Close`. Your types do not implement any
+interface from this package.
 
 ## Install
 
@@ -18,250 +19,242 @@ go get github.com/jacoelho/component
 
 ## Quick start
 
-This complete program uses a placeholder database to show construction, typed
-value access, and cleanup. Replace its lifecycle methods with your resource's
-readiness and shutdown logic.
+A store opens, is pinged at start and closed at stop. A worker uses it and
+runs until it is stopped:
 
 ```go
-package main
+dsn := component.Value("postgres://localhost/app")
+store := component.Map(dsn, OpenStore,
+	component.OnStart((*Store).Ping),
+	component.OnClose((*Store).Close))
+worker := component.MapValue(store, NewWorker,
+	component.Go((*Worker).Run))
 
-import (
-	"context"
-	"errors"
-	"fmt"
-	"time"
-
-	"github.com/jacoelho/component"
-)
-
-type Database struct{}
-type Service struct{ database *Database }
-
-func openDatabase() *Database { return &Database{} }
-func newService(database *Database) *Service {
-	return &Service{database: database}
+ctx := context.Background()
+app, err := component.New(ctx, []component.Root{worker})
+if err != nil {
+	log.Fatal(err)
 }
+if err := app.Start(ctx); err != nil {
+	log.Print(err)
+}
+if err := app.Stop(ctx); err != nil {
+	log.Print(err)
+}
+```
 
-func (*Database) Start(context.Context) error { return nil }
-func (*Database) Stop(context.Context) error  { return nil }
+It prints:
 
-func run() (err error) {
-	database := component.ProvideValue(openDatabase, component.Managed[*Database]())
-	service := component.MapValue(database, newService)
+```text
+open store
+ping store
+worker stopped
+close store
+```
 
-	runtime, err := component.New(service)
+`OpenStore`, `NewWorker` and the methods are plain functions; the full code is
+the package `Example` in [`example_test.go`](example_test.go).
+
+`New` runs the constructors, `Start` runs the start hooks and launches tasks,
+and `Stop` cancels the worker's context, waits for it, then closes the store.
+The store closes last because the worker depends on it.
+
+## Run a service
+
+A service builds the graph, starts it, waits for a signal or for a task to
+exit, then stops within a deadline:
+
+```go
+func runService() (err error) {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	handler := component.Value[http.Handler](http.NotFoundHandler())
+	srv := component.MapValue(handler, func(h http.Handler) *http.Server {
+		return &http.Server{Addr: ":8080", Handler: h, ReadHeaderTimeout: 5 * time.Second}
+	}, component.Serve())
+
+	app, err := component.New(ctx, []component.Root{srv})
 	if err != nil {
-		return err
+		return err // New has already stopped what it built
 	}
 	defer func() {
-		// Cleanup also runs after failed startup, with its own context.
-		stopCtx, cancelStop := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancelStop()
-		err = errors.Join(err, runtime.Stop(stopCtx))
+		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		err = errors.Join(err, app.Stop(stopCtx))
 	}()
-
-	startCtx, cancelStart := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelStart()
-	if err := runtime.Start(startCtx); err != nil {
+	if err := app.Start(ctx); err != nil {
 		return err
 	}
-
-	value, err := runtime.Value(service)
-	if err != nil {
-		return err
+	if err := app.Wait(ctx); ctx.Err() == nil {
+		return err // a task exited before any signal arrived
 	}
-	fmt.Println("service ready:", value.database != nil)
-	return nil
-}
-
-func main() {
-	if err := run(); err != nil {
-		panic(err)
-	}
+	return nil // a signal is a normal shutdown
 }
 ```
 
-The program prints `service ready: true`. The database starts before the
-service is constructed. Both become available only after `runtime.Start`
-succeeds; deferred cleanup runs after the service is used.
+Call `Stop` even when `Start` fails: `Start` does not roll back what it
+started. The library installs no signal handlers and sets no timeouts; every
+deadline comes from a context you pass.
 
-`Start` and `Stop` receive independent caller-created contexts. The library
-does not install signal handlers, create replacement contexts, retry work in
-the background, or provide a `Run` helper.
+`Serve` listens on `Addr` during `Start`, so an address already in use fails
+`Start`. It runs `Serve` as a task and calls `Shutdown` at stop, falling back
+to `Close` once the stop context has expired.
 
-## Construction
+## Declare nodes
 
-`Value` supplies an already-created borrowed value. It never invokes a
-function and never takes ownership:
+Each call declares one node and returns a `Ref[T]`. The refs a constructor
+takes are its dependencies, so a node can only use nodes that already exist
+and the graph cannot contain a cycle.
 
-```go
-config := component.Value(existingConfig)
-client := component.MapValue(config, client.New)
-```
+Pick the function by the constructor's result:
 
-Use the package function matching the constructor's result shape:
-
-```go
-credentials := component.ProvideContext(func(ctx context.Context) (*Credentials, error) {
-	return loadCredentials(ctx)
-})
-
-database := component.Provide(openDatabaseWithError)
-service := component.Map(database, newServiceWithError)
-```
-
-For a context-taking constructor with no error result, adapt it explicitly at
-the call site:
-
-```go
-mapped := component.MapContext(ref, func(ctx context.Context, value A) (B, error) {
-	return NewValue(ctx, value), nil
-})
-```
-
-The package functions take dependencies first, the constructor second, and
-ownership options last. The result type is the first type parameter, followed
-by dependency types. The compiler checks each dependency, constructor
-argument, result, and ownership method set:
-
-| Inputs | No error | Error | Context and error |
+| Constructor shape | No inputs | One input | 2–8 inputs |
 | --- | --- | --- | --- |
-| None | `ProvideValue(create)` | `Provide(create)` | `ProvideContext(create)` |
-| One | `MapValue(input, create)` | `Map(input, create)` | `MapContext(input, create)` |
-| Two | `MapValue2(first, second, create)` | `Map2(first, second, create)` | `MapContext2(first, second, create)` |
-| Three | `MapValue3(first, second, third, create)` | `Map3(first, second, third, create)` | `MapContext3(first, second, third, create)` |
-| Four | `MapValue4(first, second, third, fourth, create)` | `Map4(first, second, third, fourth, create)` | `MapContext4(first, second, third, fourth, create)` |
+| `func(...) T` | `ProvideValue` | `MapValue` | `MapValue2` … `MapValue8` |
+| `func(...) (T, error)` | `Provide` | `Map` | `Map2` … `Map8` |
+| `func(context.Context, ...) (T, error)` | `ProvideContext` | `MapContext` | `MapContext2` … `MapContext8` |
 
-The `2` forms through the `4` forms follow the same pattern and preserve the
-constructor's argument order. A repeated reference remains a repeated
-argument, while the graph still constructs and stops that definition once.
+Inputs come first, in the constructor's argument order, then the
+constructor, then options. A context-taking constructor receives the context
+given to `New`. `Value` declares a value you already have; the App borrows it
+and never closes it.
 
-For more than four inputs, map a named ordinary value and continue with it:
+A ref is an identity, not a type key. Two calls with the same constructor
+create two nodes, and swapping two refs of the same type swaps the arguments.
+A ref used by several nodes is built once per App.
+
+For a constructor with more than eight inputs, build a named input struct in
+its own node, or have the wiring code pass a struct of refs.
+
+## Attach lifecycle hooks
+
+Options attach to the call that creates a value, so the owner of a resource
+decides how it starts and stops:
+
+| Option | Runs |
+| --- | --- |
+| `OnStart(f)` | during `Start`, after every dependency has started |
+| `Go(f)` | as a goroutine after the node's start hooks succeed; its context is cancelled at the node's turn in `Stop` |
+| `OnDrain(f)` | at the beginning of `Stop`, before anything stops, if the node's start ran |
+| `OnStop(f)` | during `Stop`, if the node's start ran |
+| `OnClose(f)` | during `Stop`, for every built node, started or not |
+| `Serve()` | listen, serve and shut down an `*http.Server` |
+| `Label(name)` | names the node in errors and `Plan`; the default is the constructor's function name |
+
+`OnStart`, `OnStop`, `OnDrain` and `Go` take `func(T, context.Context) error`,
+which fits method expressions such as `(*sql.DB).PingContext`. `OnClose` takes
+`func(T) error`, which fits `(*sql.DB).Close`. A hook for the wrong type does
+not compile.
+
+A node's start hooks run in option order. Its stop and close hooks run in
+reverse option order, like deferred calls.
+
+## How order is decided
+
+A node starts after all of its dependencies and stops before any of them.
+Nodes with no path between them have no guaranteed order relative to each
+other.
+
+There is no way to declare an order without a dependency. When one component
+must stop before another, make it depend on what it actually uses. An HTTP
+API that submits jobs should take the worker's submitter as an input. The
+server then stops before the worker drains, and the dependency is visible in
+the constructor's signature.
+
+When a constructor needs a dependency that is already running, wrap the input
+in `Started`. `New` starts that dependency, and everything it depends on,
+before calling the constructor:
 
 ```go
-type ServiceInputs struct {
-	Config *Config
-	Logger Logger
-	Store  Store
-	Cache  Cache
+migrated := component.MapValue(component.Started(store), func(*Store) bool {
+	fmt.Println("migrate")
+	return true
+})
+```
+
+## Split the graph across packages
+
+A package exposes its part of the graph as a function from refs to refs:
+
+```go
+type StorageRefs struct {
+	Store  component.Ref[*Store]
+	Worker component.Ref[*Worker]
 }
 
-inputs := component.MapValue4(config, logger, store, cache,
-	func(c *Config, l Logger, s Store, cache Cache) ServiceInputs {
-		return ServiceInputs{Config: c, Logger: l, Store: s, Cache: cache}
-	})
-
-service := component.MapValue2(inputs, jobs,
-	func(in ServiceInputs, jobs JobConfig) *Service {
-		return NewService(in, jobs)
-	})
+func StorageGraph(dsn component.Ref[string]) StorageRefs {
+	store := component.Map(dsn, OpenStore,
+		component.OnStart((*Store).Ping),
+		component.OnClose((*Store).Close))
+	worker := component.MapValue(store, NewWorker, component.Go((*Worker).Run))
+	return StorageRefs{Store: store, Worker: worker}
+}
 ```
 
-Use an intermediate named value when it represents a cohesive or reused
-capability. The package surface does not add grouping methods or types merely
-to shorten one constructor call.
+Other packages take `StorageRefs.Store` as an input. Refs carry their edges,
+so the order holds across packages without either package importing the
+other. Call `StorageGraph` once and pass its refs on; a second call creates a
+second store. Domain packages do not need to import `component` if their
+graph functions live in a separate wiring package.
 
-Interface adaptation remains ordinary Go assignment:
+## Test with replacements
+
+`Replace` substitutes a value for a node. Its constructor and hooks never run,
+and nodes reachable only through it are never built. With the quick start's
+`store` and `worker`:
 
 ```go
-database := component.ProvideValue(openDatabase, component.Managed[*Database]())
-store := component.MapValue(database, func(db *Database) Store {
-	return db
-})
-service := component.MapValue(store, newService)
+app, err := component.New(context.Background(), []component.Root{worker},
+	component.Replace(store, &Store{dsn: "memory"}))
+if err != nil {
+	log.Fatal(err)
+}
+w, _ := component.Get(app, worker)
+fmt.Println(w.store.dsn) // memory
 ```
 
-`store` is an unmanaged interface alias. `database` remains the lifecycle
-owner. Pass `Managed[Store]` only when the mapping creates a distinct resource
-that owns its own lifecycle; marking an alias as owned would violate the
-fresh-resource contract.
+The replacement is type-checked against the ref. `Get` reads any node's value
+from a successful `New` until `Stop` begins. To test part of a graph, pass
+only its refs as roots. `Plan` lists every node's label and dependencies in
+start order.
 
-Each `Ref[T]` is typed and comparable even when `T` is a slice, map, or
-function. References of different `T` values cannot be explicitly converted.
-Independent references with the same `T` remain distinct; swapping them in a
-multi-input call changes the constructor arguments. Repeating one reference
-supplies the same value at each position and constructs that definition once.
-`New` checks zero or invalid references, nil constructors, duplicate ownership
-options, and cycles before any constructor runs. Only references reachable from
-the roots passed to `New` are included. A shared reference is constructed once
-per runtime, even when several nodes use it.
+## Shutdown and errors
 
-## Ownership and lifecycle
+`Stop` runs every drain hook first, then visits nodes in reverse order. For
+each node it cancels the node's task context, runs its stop and close hooks,
+then waits for its tasks. Hooks run before the wait, so `Shutdown` is what
+ends a task blocked in `Serve`.
 
-A constructor without an ownership argument produces an unmanaged value. A
-constructor with one `Ownership[T]` from `Managed[T]` produces an owned
-resource. `T` implements the `Lifecycle` interface, whose `Start` and `Stop`
-methods receive only the caller's context. `Start` is required, even for an
-inert resource; its method can return nil. An unmanaged value stays unmanaged
-even if it happens to implement `Lifecycle`:
+`Stop` continues after errors and runs each hook at most once. Once the stop
+context is done, it stops waiting for tasks and reports each one still running
+as `ErrAbandoned`, but still calls the remaining hooks. Calling `Stop` again
+returns the first call's result.
 
-```go
-source := component.MapValue(sink, NewSource,
-	component.Managed[*Source]())
+A `Stop` issued while `Start` is running cancels `Start`'s context and waits
+for the running hook to return. Do not call `Stop` or `Start` from a hook or a
+task of the same App, because it deadlocks. A task that wants the App to stop
+returns instead, and `Wait` reports it.
 
-named := component.Managed[*Source]()
-named.Name = "source" // optional diagnostic name
-namedSource := component.MapValue(sink, NewSource, named)
-```
+If a constructor fails or panics, `New` stops what it has built and returns a
+nil App. Every failure is a `*NodeError` carrying the node's label and phase,
+and the original error stays reachable with `errors.Is` and `errors.As`.
+Panics become a `*PanicError` with the stack.
 
-An owned factory must create a distinct resource for that runtime. It must not
-return an input or another owned object. Go cannot prove freshness, so this is
-an application contract. Use `Value` for an intentionally shared borrowed
-object.
+## Limits
 
-Ownership transfers only when a factory returns successfully. If a factory
-returns an error, it must clean up its own partial acquisition, even if it also
-returns a value. A successful managed factory must return a non-nil resource.
+- Constructors and hooks run one at a time. Tasks run concurrently, one
+  goroutine each.
+- An App is single-use: it starts once and cannot restart after `Stop`.
+- A constructor or hook that calls `runtime.Goexit`, as `t.FailNow` does,
+  ends the goroutine that called `New`, `Start` or `Stop`. In a task it is
+  reported as an exit.
+- `Serve` does not report the address it bound, so with port 0 in `Addr` you
+  cannot learn which port it chose.
 
-`ProvideValue` and `MapValue` only describe factories that do not return an
-error. They do not make startup infallible: a factory may panic, and a managed
-resource's `Start` or `Stop` may fail. Runtime errors retain the node context;
-an owned value that was constructed before a later failure remains available
-for cleanup.
+## More
 
-Every owned `Stop` method must tolerate repeated calls and partial cleanup. A
-nil result means the node is complete. An error leaves it pending; the next
-caller `Stop` may retry it once, while successful stops are never repeated.
-The library does not guess whether a third-party `Close` made progress or
-translate an already-closed error. Adapt such APIs in application code.
-Failed cleanup retains the node's dependencies and returns
-`ErrCleanupPending`, detectable with `errors.Is`. Call `Stop` again to retry
-with a suitable context; the quick start reports cleanup errors without
-retrying.
-
-The runtime allows one startup attempt and cannot be restarted. Overlapping
-`Start` or `Stop` calls return `ErrBusy`. The application calls `Stop` after a
-failed `Start` to release resources that were successfully constructed,
-including resources whose `Start` method failed. Nodes run one at a time in
-stable dependency order. A factory and its `Start` method form one handoff;
-once that factory succeeds, its `Start` method still runs even if the
-operation context is canceled while the factory is returning.
-
-## Context, values, and limits
-
-Context-taking factories and lifecycle methods receive exactly the context
-supplied by the caller. Cancellation prevents the next node from being
-dispatched. The current factory or lifecycle callback is allowed to finish,
-and the operation cannot forcibly stop user code. Nil contexts are rejected
-before runtime state changes. `Runtime.Value(ref)` is available only while a
-runtime is successfully running and returns a typed value; it is not a
-resolver for constructors. Stop using returned values before calling `Stop`.
-
-Resources that launch background work must own their context and join that
-work during shutdown; the startup context bounds startup. The runtime does not
-run independent nodes concurrently, roll back startup, install signals or
-timeouts, retry cleanup in the background, infer dependencies from closure
-captures, or discover message topology. Queue admission, message limits,
-worker shutdown, and provider-specific timeouts belong to the application
-owner at the resource boundary. A callback that ignores cancellation can
-determine operation latency.
-
-## Complete examples and architecture
-
-[`example_test.go`](example_test.go) shows lifecycle order in an executable
-example. [`integration_test.go`](integration_test.go) contains a deterministic
-source-to-processor-to-sink pipeline and a hermetic HTTP listener example. The
-tests show readiness handshakes, graceful drain, caller-owned contexts, and
-cleanup after failed startup.
-
-[`ARCHITECTURE.md`](ARCHITECTURE.md) is the canonical architecture entry point.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): the full lifecycle contract, the
+  rejected alternatives and open questions.
+- `go doc github.com/jacoelho/component`: the API reference.
+- [`LICENSE`](LICENSE).
