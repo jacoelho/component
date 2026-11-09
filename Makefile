@@ -24,3 +24,8 @@ ci-tidy:
 .PHONY: staticcheck
 staticcheck:
 	go run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) ./...
+
+.PHONY: ci-generate
+ci-generate:
+	go generate ./...
+	git diff --exit-code -- constructors_gen.go

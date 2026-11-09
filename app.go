@@ -12,6 +12,7 @@ import (
 // App owns one value per node reachable from its roots, and the hooks and
 // tasks attached to them. New builds every value, Start starts them in
 // dependency order, and Stop stops them in reverse. An App is single-use.
+// New and Start do not roll back a failure: Stop is the only teardown.
 type App struct {
 	stopErr   error
 	index     map[*node]int
@@ -26,21 +27,23 @@ type App struct {
 	// mu guards state, stopStart, exitTask and exitClaim.
 	mu       sync.Mutex
 	stopOnce sync.Once
-	// state changes only in beginStart, endStart and beginStop.
+	// state changes only in failBuild, beginStart, endStart and beginStop.
 	state appState
 	// exitClaim records whether Wait or Stop reported the first task exit,
 	// so exactly one of them returns it.
 	exitClaim exitClaim
 }
 
-// appState is the App's lifecycle. It only advances:
+// appState is the App's lifecycle. New leaves it appBuilt or appFailed, and
+// it only advances:
 //
 //	appBuilt -> appStarting -> appStarted
-//	any of them -> appStopping
+//	any of them, or appFailed -> appStopping
 type appState uint8
 
 const (
 	appBuilt    appState = iota // New built every node; Start has not been called
+	appFailed                   // New returned an error; only Stop does work
 	appStarting                 // Start is dispatching nodes; stopStart cancels it
 	appStarted                  // Start returned, with or without an error
 	appStopping                 // Stop began; final
@@ -110,10 +113,31 @@ type PlanNode struct {
 // A Started input starts that dependency, and everything it depends on,
 // before the consumer is built.
 //
-// If a constructor fails or panics, New stops building, runs the Stop
-// procedure with ctx on everything built so far, and returns a nil App with
-// every error joined. Constructors given a context receive ctx.
+// New always returns a non-nil App. If a declaration is invalid, or a
+// constructor fails or panics, New stops building and returns the error with
+// a failed App: Start, Wait and Get return ErrBuildFailed, and Stop tears down
+// whatever was built or started. Like Start, New does not roll back: call
+// Stop, with a context that is still live, whether or not New succeeded.
+// Constructors given a context receive ctx.
 func New(ctx context.Context, roots []Root, opts ...AppOption) (*App, error) {
+	a := &App{
+		stopBegun: make(chan struct{}),
+		exited:    make(chan struct{}),
+	}
+	err := a.plan(roots, opts)
+	for i := 0; err == nil && i < len(a.nodes); i++ {
+		err = a.build(ctx, i)
+	}
+	if err != nil {
+		a.failBuild()
+	}
+	//nolint:nilnil // The App comes with the error on purpose: the caller's Stop is the only teardown.
+	return a, err
+}
+
+// plan validates the declarations and creates a pending instance per
+// reachable node, in build order. It runs no constructor.
+func (a *App) plan(roots []Root, opts []AppOption) error {
 	replace, errs := replacements(opts)
 	order, index, planErrs := sortGraph(roots, replace)
 	errs = append(errs, planErrs...)
@@ -123,15 +147,10 @@ func New(ctx context.Context, roots []Root, opts ...AppOption) (*App, error) {
 		}
 	}
 	if len(errs) != 0 {
-		return nil, errors.Join(errs...)
+		return errors.Join(errs...)
 	}
 
-	a := &App{
-		nodes:     make([]*instance, len(order)),
-		index:     index,
-		stopBegun: make(chan struct{}),
-		exited:    make(chan struct{}),
-	}
+	a.nodes, a.index = make([]*instance, len(order)), index
 	for i, n := range order {
 		inst := &instance{decl: n, label: n.label}
 		if v, ok := replace[n]; ok {
@@ -144,14 +163,7 @@ func New(ctx context.Context, roots []Root, opts ...AppOption) (*App, error) {
 		}
 		a.nodes[i] = inst
 	}
-
-	for i := range a.nodes {
-		if err := a.build(ctx, i); err != nil {
-			a.beginStop()
-			return nil, errors.Join(err, a.teardown(ctx))
-		}
-	}
-	return a, nil
+	return nil
 }
 
 func replacements(opts []AppOption) (map[*node]any, []error) {
@@ -202,7 +214,7 @@ func sortGraph(roots []Root, replace map[*node]any) ([]*node, map[*node]int, []e
 				top.next++
 				if in == nil {
 					errs = append(errs, &NodeError{Label: n.label, Phase: PhaseBuild,
-						Err: fmt.Errorf("%w: input %d is nil or a zero Ref", ErrInvalidReference, top.next)})
+						Err: fmt.Errorf("%w: input %d is nil or a zero Ref", ErrInvalidReference, top.next-1)})
 					continue
 				}
 				if _, done := index[in]; !done {
@@ -293,9 +305,12 @@ func (a *App) startClosure(ctx context.Context, i int) error {
 // hooks in option order and then launches its Go tasks. Each task's context
 // keeps ctx's values but not its cancellation; Stop cancels it.
 //
-// Start stops at the first failure, when ctx is done, or when Stop is
-// called, and returns an error naming the node. It does not roll back: call Stop. Start runs once;
-// a second call returns ErrStarted, and a call after Stop returns ErrStopped.
+// Start stops at the first failure, returning a *NodeError for the node whose
+// hook failed, or before the next node once ctx is done or Stop is called,
+// returning an error that wraps context.Cause(ctx) or ErrStopped. It does not
+// roll back: call Stop. Start runs once;
+// a second call returns ErrStarted, a call after Stop returns ErrStopped, and
+// a call on an App whose New failed returns ErrBuildFailed.
 func (a *App) Start(ctx context.Context) error {
 	a.op.Lock()
 	defer a.op.Unlock()
@@ -310,14 +325,23 @@ func (a *App) Start(ctx context.Context) error {
 			continue
 		}
 		// A Stop issued since beginStart has cancelled ctx with ErrStopped.
+		// No node failed, so this is not a NodeError.
 		if ctx.Err() != nil {
-			return &NodeError{Label: inst.label, Phase: PhaseStart, Err: context.Cause(ctx)}
+			return fmt.Errorf("component: start cancelled before %s: %w", inst.label, context.Cause(ctx))
 		}
 		if err := a.startNode(ctx, i); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// failBuild moves appBuilt to appFailed. It takes mu because a task started
+// through a Started input may already be reading the state.
+func (a *App) failBuild() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.state = appFailed
 }
 
 // beginStart moves appBuilt to appStarting and registers cancel in the same
@@ -330,6 +354,8 @@ func (a *App) beginStart(cancel context.CancelCauseFunc) error {
 	case appBuilt:
 		a.state, a.stopStart = appStarting, cancel
 		return nil
+	case appFailed:
+		return ErrBuildFailed
 	case appStopping:
 		return ErrStopped
 	default:
@@ -415,8 +441,12 @@ func (a *App) recordExit(ctx context.Context, label string, t *task, err error) 
 // a *NodeError, or ErrExited if it returned nil or called runtime.Goexit.
 // It returns ErrStopped once Stop begins, unless the exit happened earlier
 // and Stop has not reported it. Each exit is returned by Wait or by Stop,
-// never both. Wait stops nothing.
+// never both. On an App whose New failed it returns ErrBuildFailed until
+// Stop begins, and Stop reports any task exit. Wait stops nothing.
 func (a *App) Wait(ctx context.Context) error {
+	if a.currentState() == appFailed {
+		return ErrBuildFailed
+	}
 	select {
 	case <-a.exited:
 		return a.reportExit()
@@ -444,11 +474,14 @@ func (a *App) reportExit() error {
 
 // Stop shuts the App down:
 //
-//  1. OnDrain hooks of every node whose start ran, in reverse dependency
+//  1. OnDrain hooks of every node whose start began, in reverse dependency
 //     order.
 //  2. Per node, in reverse dependency order: cancel its tasks' context, run
-//     its OnStop hooks (only if its start ran) and OnClose hooks in reverse
+//     its OnStop hooks (only if its start began) and OnClose hooks in reverse
 //     option order, then wait for its tasks.
+//
+// A node's start began once Start reached it, even if one of its OnStart
+// hooks then failed, so OnStop and OnDrain must tolerate a failed start.
 //
 // Stop continues after errors and runs each hook at most once; errors are
 // returned joined, each wrapped in a *NodeError. Once ctx is done, Stop no
@@ -473,8 +506,7 @@ func (a *App) Stop(ctx context.Context) error {
 }
 
 // beginStop moves any state to appStopping, cancelling a running Start. Each
-// App reaches it once: through Stop's sync.Once, or in New before the App is
-// returned.
+// App reaches it once, through Stop's sync.Once.
 func (a *App) beginStop() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -486,10 +518,10 @@ func (a *App) beginStop() {
 	close(a.stopBegun)
 }
 
-func (a *App) isStopping() bool {
+func (a *App) currentState() appState {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.state == appStopping
+	return a.state
 }
 
 func (a *App) teardown(ctx context.Context) error {
@@ -515,10 +547,17 @@ func (a *App) teardown(ctx context.Context) error {
 			inst.cancel()
 		}
 		for _, h := range slices.Backward(inst.hooks) {
-			if h.kind == hookClose || (h.kind == hookStop && inst.state == nodeBegun) {
-				if err := call(ctx, h.run, inst.value); err != nil {
-					errs = append(errs, &NodeError{Label: inst.label, Phase: PhaseStop, Err: err})
-				}
+			var phase Phase
+			switch {
+			case h.kind == hookClose:
+				phase = PhaseClose
+			case h.kind == hookStop && inst.state == nodeBegun:
+				phase = PhaseStop
+			default:
+				continue
+			}
+			if err := call(ctx, h.run, inst.value); err != nil {
+				errs = append(errs, &NodeError{Label: inst.label, Phase: phase, Err: err})
 			}
 		}
 		for _, t := range inst.tasks {
@@ -569,7 +608,9 @@ func (a *App) claimForStop(t *task) bool {
 	return true
 }
 
-// Plan lists the App's nodes in start order. Stop runs them in reverse.
+// Plan lists the App's nodes in build order, each after its dependencies.
+// Start follows the same order, except that a node taken as a Started input
+// has already started during New. Stop runs the order in reverse.
 func (a *App) Plan() []PlanNode {
 	plan := make([]PlanNode, len(a.nodes))
 	for i, inst := range a.nodes {
@@ -579,11 +620,16 @@ func (a *App) Plan() []PlanNode {
 }
 
 // Get returns r's value. It works from a successful New until Stop begins,
-// then returns ErrStopped. A Ref not in the App returns ErrInvalidReference.
+// then returns ErrStopped. An App whose New failed returns ErrBuildFailed
+// until then. A Ref not in the App returns ErrInvalidReference.
 func Get[T any](a *App, r Ref[T]) (T, error) {
 	var zero T
-	if a.isStopping() {
+	switch a.currentState() {
+	case appStopping:
 		return zero, ErrStopped
+	case appFailed:
+		return zero, ErrBuildFailed // values are partial
+	default:
 	}
 	i, ok := a.index[r.node]
 	if !ok {

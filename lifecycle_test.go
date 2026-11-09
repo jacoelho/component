@@ -100,7 +100,11 @@ func TestStartStopsDispatchWhenItsContextIsDone(t *testing.T) {
 	app := mustNew(t, []component.Root{second})
 
 	err := app.Start(ctx)
-	requireNodeError(t, err, "second", component.PhaseStart, cause)
+	requireIs(t, err, cause)
+	// No node failed: the cancellation is not attributed to one.
+	if ne := (*component.NodeError)(nil); errors.As(err, &ne) {
+		t.Fatalf("Start blamed node %q for its own cancelled context: %v", ne.Label, err)
+	}
 	requireAbsent(t, rec.list(), "start second")
 	if err := app.Stop(testContext(t)); err != nil {
 		t.Fatalf("Stop: %v", err)
@@ -210,7 +214,7 @@ func TestStopContinuesAfterErrorsAndRunsEachHookOnce(t *testing.T) {
 	requireNodeError(t, err, "api", component.PhaseStop, errStop)
 	requireNodeError(t, err, "api", component.PhaseStop, component.ErrPanic)
 	requireNodeError(t, err, "api", component.PhaseTask, errTask)
-	requireNodeError(t, err, "db", component.PhaseStop, errClose)
+	requireNodeError(t, err, "db", component.PhaseClose, errClose)
 	for i, e := range errs {
 		if e != err { //nolint:errorlint // identity: every caller gets the first call's error value
 			t.Fatalf("Stop call %d returned %v, want the first call's result", i, e)

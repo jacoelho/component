@@ -131,8 +131,8 @@ func TestConstructorFormsPassResultsErrorsAndContext(t *testing.T) {
 			if tt.wantErr != nil {
 				requireIs(t, err, tt.wantErr)
 				requireNodeError(t, err, "", component.PhaseBuild, tt.wantErr)
-				if app != nil {
-					t.Fatal("New returned an App after a constructor failed")
+				if err := app.Stop(ctx); err != nil {
+					t.Fatalf("Stop after a failed New: %v", err)
 				}
 				return
 			}
@@ -176,11 +176,14 @@ func TestNewRejectsInvalidDeclarationsBeforeBuilding(t *testing.T) {
 			built = 0
 			app, err := component.New(testContext(t), tt.roots, tt.opts...)
 			requireIs(t, err, tt.want)
-			if app != nil {
-				t.Fatal("New returned an App with an error")
-			}
 			if built != 0 {
 				t.Fatalf("a constructor ran %d times before validation finished", built)
+			}
+			// The failed App is still safe to use: nothing was built, so
+			// Stop has nothing to do.
+			requireIs(t, app.Start(testContext(t)), component.ErrBuildFailed)
+			if err := app.Stop(testContext(t)); err != nil {
+				t.Fatalf("Stop after a rejected declaration: %v", err)
 			}
 		})
 	}
@@ -194,7 +197,32 @@ func TestNewReportsEveryDeclarationError(t *testing.T) {
 	requireNodeError(t, err, "second", component.PhaseBuild, component.ErrInvalidDefinition)
 }
 
-func TestNewFailureStopsWhatWasBuiltAndBuildsNothingMore(t *testing.T) {
+func TestNewNamesAnInvalidInputByItsArgumentPosition(t *testing.T) {
+	var zero component.Ref[int]
+	valid := component.Value(1)
+	n := component.MapValue2(valid, zero, func(int, int) int { return 0 }, component.Label[int]("sum"))
+	_, err := component.New(testContext(t), []component.Root{n})
+	requireNodeError(t, err, "sum", component.PhaseBuild, component.ErrInvalidReference)
+	// Zero-based, like the root index in the same family of errors.
+	if !strings.Contains(err.Error(), "input 1 ") {
+		t.Fatalf("error does not name input 1, the second argument: %v", err)
+	}
+}
+
+func TestNewReportsEveryInvalidOptionOfOneNode(t *testing.T) {
+	n := component.ProvideValue(func() int { return 0 },
+		component.OnStart[int](nil), component.OnDrain[int](nil), component.Label[int](""))
+	_, err := component.New(testContext(t), []component.Root{n})
+	requireIs(t, err, component.ErrInvalidDefinition)
+	// The message must name each option to fix, not only the last one.
+	for _, option := range []string{"OnStart", "OnDrain", "Label"} {
+		if !strings.Contains(err.Error(), option+" requires") {
+			t.Errorf("error does not report the invalid %s option: %v", option, err)
+		}
+	}
+}
+
+func TestNewFailureLeavesTeardownToStop(t *testing.T) {
 	rec := &recorder{}
 	failure := errors.New("dial failed")
 	pool := component.ProvideValue(func() string { rec.add("build pool"); return "pool" }, hooks[string](rec, "pool")...)
@@ -207,10 +235,22 @@ func TestNewFailureStopsWhatWasBuiltAndBuildsNothingMore(t *testing.T) {
 
 	app, err := component.New(testContext(t), []component.Root{after})
 
-	if app != nil {
-		t.Fatal("New returned an App after a constructor failed")
-	}
 	requireNodeError(t, err, "broken", component.PhaseBuild, failure)
+	// The failed App refuses everything but Stop, and New tore nothing down.
+	requireIs(t, app.Start(testContext(t)), component.ErrBuildFailed)
+	requireIs(t, app.Wait(testContext(t)), component.ErrBuildFailed)
+	if _, err := component.Get(app, pool); !errors.Is(err, component.ErrBuildFailed) {
+		t.Fatalf("Get on a failed App = %v, want ErrBuildFailed", err)
+	}
+	requireAbsent(t, rec.list(), "close pool")
+	requireAbsent(t, rec.list(), "stop cache")
+
+	if err := app.Stop(testContext(t)); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if _, err := component.Get(app, pool); !errors.Is(err, component.ErrStopped) {
+		t.Fatalf("Get after Stop = %v, want ErrStopped", err)
+	}
 	events := rec.list()
 	requireAbsent(t, events, "build after")
 	// Built but not started: closed, never stopped or drained.
@@ -226,17 +266,79 @@ func TestNewFailureStopsWhatWasBuiltAndBuildsNothingMore(t *testing.T) {
 	requireBefore(t, events, "stop cache", "close cache")
 }
 
+// A build cancelled by its own context must still shut down gracefully: the
+// stop context, not the dead build context, governs teardown.
+func TestStopAfterACancelledNewUsesTheStopContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(testContext(t))
+	var stopCtxErr error
+	finished := make(chan struct{})
+	worker := component.ProvideValue(func() string { return "worker" }, component.Label[string]("worker"),
+		component.Go(func(_ string, ctx context.Context) error {
+			defer close(finished)
+			<-ctx.Done()
+			return ctx.Err()
+		}),
+		component.OnStop(func(_ string, ctx context.Context) error {
+			stopCtxErr = ctx.Err()
+			return nil
+		}))
+	consumer := component.MapContext(component.Started(worker), func(ctx context.Context, _ string) (int, error) {
+		cancel() // the signal or startup deadline arrives mid-build
+		return 0, ctx.Err()
+	}, component.Label[int]("consumer"))
+
+	app, err := component.New(ctx, []component.Root{consumer})
+	requireNodeError(t, err, "consumer", component.PhaseBuild, context.Canceled)
+
+	if err := app.Stop(testContext(t)); err != nil {
+		t.Fatalf("Stop = %v, want nil: the task ended cleanly within the stop context", err)
+	}
+	if stopCtxErr != nil {
+		t.Fatalf("OnStop saw a context that was already done: %v", stopCtxErr)
+	}
+	select {
+	case <-finished:
+	default:
+		t.Fatal("Stop returned before the started task finished")
+	}
+}
+
+// A task started during New may exit while a later constructor is still
+// running. The failed App must record it without racing New, and Stop must
+// report it.
+func TestStopReportsATaskThatExitedDuringAFailedNew(t *testing.T) {
+	failure := errors.New("dial failed")
+	returning := make(chan struct{})
+	worker := component.ProvideValue(func() string { return "worker" }, component.Label[string]("worker"),
+		component.Go(func(string, context.Context) error {
+			close(returning)
+			return nil
+		}))
+	consumer := component.Map(component.Started(worker), func(string) (int, error) {
+		<-returning
+		return 0, failure
+	}, component.Label[int]("consumer"))
+
+	app, err := component.New(testContext(t), []component.Root{consumer})
+	requireNodeError(t, err, "consumer", component.PhaseBuild, failure)
+
+	requireNodeError(t, app.Stop(testContext(t)), "worker", component.PhaseTask, component.ErrExited)
+}
+
 func TestNewRecoversConstructorPanics(t *testing.T) {
 	rec := &recorder{}
 	dep := component.ProvideValue(func() int { return 1 }, hooks[int](rec, "dep")...)
 	boom := component.MapValue(dep, func(int) string { panic("boom") }, component.Label[string]("boom"))
 
-	_, err := component.New(testContext(t), []component.Root{boom})
+	app, err := component.New(testContext(t), []component.Root{boom})
 
 	requireNodeError(t, err, "boom", component.PhaseBuild, component.ErrPanic)
 	var pe *component.PanicError
 	if !errors.As(err, &pe) || pe.Value != "boom" || len(pe.Stack) == 0 {
 		t.Fatalf("PanicError = %+v, want value %q with a stack", pe, "boom")
+	}
+	if err := app.Stop(testContext(t)); err != nil {
+		t.Fatalf("Stop: %v", err)
 	}
 	requireOnce(t, rec.list(), "close dep")
 }
@@ -342,7 +444,7 @@ func TestGetRejectsRefsOutsideTheApp(t *testing.T) {
 
 func newPrimaryDB(config) *database { return &database{} }
 
-func TestPlanListsLabelsAndEdgesInStartOrder(t *testing.T) {
+func TestPlanListsLabelsAndEdgesInBuildOrder(t *testing.T) {
 	cfg := component.Value(config{})
 	db := component.MapValue(cfg, newPrimaryDB)
 	repo := component.MapValue(db, func(d *database) *repository { return &repository{db: d} }, component.Label[*repository]("repo"))

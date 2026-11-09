@@ -23,3 +23,5 @@
 // stop context's deadline. See the README for a guide and ARCHITECTURE.md for
 // the full contract.
 package component
+
+//go:generate go run ./internal/genconstructors

@@ -71,7 +71,7 @@ func requireIs(t *testing.T, err, target error) {
 
 // requireNodeError asserts that err contains a *NodeError for label and
 // phase whose cause matches target. An empty label matches any node.
-func requireNodeError(t *testing.T, err error, label, phase string, target error) {
+func requireNodeError(t *testing.T, err error, label string, phase component.Phase, target error) {
 	t.Helper()
 	for _, e := range flatten(err) {
 		var ne *component.NodeError
@@ -108,7 +108,7 @@ func mustNew(t *testing.T, roots []component.Root, opts ...component.AppOption) 
 	t.Helper()
 	app, err := component.New(testContext(t), roots, opts...)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("New: %v; Stop: %v", err, app.Stop(testContext(t)))
 	}
 	return app
 }
