@@ -1,7 +1,7 @@
 # disable default rules
 .SUFFIXES:
 MAKEFLAGS+=-r -R
-STATICCHECK_VERSION = v0.8.0-rc.1
+STATICCHECK_VERSION = v0.8.2
 
 default: test
 
